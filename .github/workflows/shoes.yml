@@ -1,0 +1,61 @@
+name: build-shoes
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+
+    steps:
+      - id: tag
+        run: |
+          url=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/cfal/shoes/releases/latest)
+          echo "tag=${url##*/}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cfal/shoes
+          ref: master
+          fetch-depth: 1
+          path: shoes
+
+      - id: sha
+        working-directory: shoes
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - working-directory: shoes
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+          BIN="target/${{ matrix.target }}/release/shoes"
+          test -f "$BIN"
+          cp "$BIN" shoes && strip shoes 2>/dev/null || true
+          tar -czf "shoes-${{ matrix.target }}-${{ steps.tag.outputs.tag }}.tar.gz" shoes
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          overwrite_files: true
+          files: shoes/shoes-*.tar.gz
+          body: ${{ steps.sha.outputs.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
