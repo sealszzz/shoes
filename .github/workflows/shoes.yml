@@ -11,21 +11,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
 
     steps:
-      - id: tag
-        run: |
-          url=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/cfal/shoes/releases/latest)
-          echo "tag=${url##*/}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
           repository: cfal/shoes
           ref: master
           fetch-depth: 1
+          fetch-tags: true
           path: shoes
+
+      - id: tag
+        working-directory: shoes
+        run: |
+          set -euo pipefail
+          ver="$(awk -F'"' '/^version *= *"/{print $2; exit}' Cargo.toml)"
+          test -n "$ver"
+          echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
 
       - id: sha
         working-directory: shoes
@@ -46,14 +51,19 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }}
           fi
+
           BIN="target/${{ matrix.target }}/release/shoes"
           test -f "$BIN"
-          cp "$BIN" shoes && strip shoes 2>/dev/null || true
+
+          cp "$BIN" shoes
+          strip shoes 2>/dev/null || true
+
           tar -czf "shoes-${{ matrix.target }}-${{ steps.tag.outputs.tag }}.tar.gz" shoes
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           overwrite_files: true
           files: shoes/shoes-*.tar.gz
           body: ${{ steps.sha.outputs.sha }}
