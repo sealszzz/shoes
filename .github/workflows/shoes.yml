@@ -66,6 +66,8 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           overwrite_files: true
           files: shoes/shoes-*.tar.gz
-          body: ${{ steps.sha.outputs.sha }}
+          body: |
+            Commit: ${{ steps.sha.outputs.sha }}
+            Build from: https://github.com/cfal/shoes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
