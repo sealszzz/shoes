@@ -3,6 +3,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - .github/workflows/build-shoes.yml
 
 permissions:
   contents: write
@@ -42,6 +44,11 @@ jobs:
 
       - if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --locked
+
+      - name: Patch Source Code (Unlock Log Levels)
+        working-directory: shoes
+        run: |
+          sed -i -E 's/release_max_level_[a-zA-Z0-9_]*/release_max_level_trace/g' Cargo.toml
 
       - working-directory: shoes
         run: |
