@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - .github/workflows/build-shoes.yml
+      - .github/workflows/shoes.yml
 
 permissions:
   contents: write
