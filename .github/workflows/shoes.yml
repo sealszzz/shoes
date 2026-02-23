@@ -50,6 +50,12 @@ jobs:
         run: |
           sed -i -E 's/release_max_level_[a-zA-Z0-9_]*/release_max_level_trace/g' Cargo.toml
 
+      - name: Fetch and Replace UoT files
+        working-directory: shoes
+        run: |
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_common.rs -o src/uot/uot_common.rs
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_v1_server_stream.rs -o src/uot/uot_v1_server_stream.rs
+
       - working-directory: shoes
         run: |
           set -euo pipefail
