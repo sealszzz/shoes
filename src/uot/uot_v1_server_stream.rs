@@ -13,7 +13,8 @@ use std::task::{Context, Poll};
 use futures::ready;
 use tokio::io::ReadBuf;
 
-use super::uot_common::{parse_uot_address, write_uot_address};
+// NEW: Use addrparser variants instead of socks5 variants
+use super::uot_common::{parse_uot_addrparser_address, write_uot_addrparser_address};
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
@@ -76,8 +77,8 @@ impl<S: AsyncStream> UotV1ServerStream<S> {
     fn try_parse_packet(&self) -> std::io::Result<Option<(NetLocation, usize, usize)>> {
         let data = self.read_buf.as_slice();
 
-        // Try to parse the address
-        let (location, addr_len) = match parse_uot_address(data)? {
+        // Try to parse the address using AddrParser format // NEW: Updated comment
+        let (location, addr_len) = match parse_uot_addrparser_address(data)? {
             Some(result) => result,
             None => return Ok(None),
         };
@@ -225,8 +226,8 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
             ))));
         }
 
-        // Write UoT address format
-        let offset = write_uot_address(&mut this.write_buf, source);
+        // Write UoT AddrParser address format // NEW: Updated comment
+        let offset = write_uot_addrparser_address(&mut this.write_buf, source);
 
         // Write length prefix (u16be)
         let len_bytes = (buf.len() as u16).to_be_bytes();
