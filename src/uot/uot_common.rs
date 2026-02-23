@@ -23,7 +23,6 @@
 //!    - Used by: UoT V1 packet payloads, UoT V2 non-connect mode payloads
 //!
 //! This module implements both SOCKS5 and AddrParser formats to support all UoT modes.
-payloads
 //! NEW: Updated comment to reflect both formats are implemented.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
