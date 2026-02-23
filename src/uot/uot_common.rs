@@ -22,18 +22,25 @@
 //! 2. **AddrParser format** - 0x00/0x01/0x02
 //!    - Used by: UoT V1 packet payloads, UoT V2 non-connect mode payloads
 //!
-//! This module implements SOCKS5 format since that's what h2mux uses.
+//! This module implements both SOCKS5 and AddrParser formats to support all UoT modes.
+payloads
+//! NEW: Updated comment to reflect both formats are implemented.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// SOCKS5 ATYP values (used by h2mux packet_addr mode)
+/// SOCKS5 ATYP values (used by h2mux packet_addr mode and UoT V2 headers)
 pub const ATYP_IPV4: u8 = 0x01;
 pub const ATYP_DOMAIN: u8 = 0x03;
 pub const ATYP_IPV6: u8 = 0x04;
 
-/// Parse UoT address format (ATYP + address + port)
+// NEW: AddrParser ATYP values (used by UoT V1/V2 payloads)
+pub const ADDRPARSER_ATYP_IPV4: u8 = 0x00;
+pub const ADDRPARSER_ATYP_IPV6: u8 = 0x01;
+pub const ADDRPARSER_ATYP_DOMAIN: u8 = 0x02;
+
+/// Parse UoT address format (SOCKS5 ATYP + address + port)
 /// Returns Ok(Some((NetLocation, bytes consumed))) on success.
 /// Returns Ok(None) if data is truncated (need more data).
 /// Returns Err for invalid data (unknown ATYP, invalid UTF-8).
@@ -86,7 +93,7 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
     }
 }
 
-/// Write UoT address format (ATYP + address + port) from SocketAddr
+/// Write UoT address format (SOCKS5 ATYP + address + port) from SocketAddr
 /// Returns number of bytes written
 #[inline]
 pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
@@ -99,6 +106,72 @@ pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
         }
         SocketAddr::V6(v6) => {
             buf[0] = ATYP_IPV6;
+            buf[1..17].copy_from_slice(&v6.ip().octets());
+            buf[17..19].copy_from_slice(&v6.port().to_be_bytes());
+            19
+        }
+    }
+}
+
+// NEW: Parse AddrParser format
+#[inline]
+pub fn parse_uot_addrparser_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, usize)>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let atyp = data[0];
+    match atyp {
+        ADDRPARSER_ATYP_IPV4 => {
+            if data.len() < 7 {
+                return Ok(None);
+            }
+            let ip = Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+            let port = u16::from_be_bytes([data[5], data[6]]);
+            Ok(Some((NetLocation::new(Address::Ipv4(ip), port), 7)))
+        }
+        ADDRPARSER_ATYP_IPV6 => {
+            if data.len() < 19 {
+                return Ok(None);
+            }
+            let ip_bytes: [u8; 16] = data[1..17].try_into().unwrap();
+            let ip = Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([data[17], data[18]]);
+            Ok(Some((NetLocation::new(Address::Ipv6(ip), port), 19)))
+        }
+        ADDRPARSER_ATYP_DOMAIN => {
+            if data.len() < 2 {
+                return Ok(None);
+            }
+            let domain_len = data[1] as usize;
+            let total_len = 1 + 1 + domain_len + 2;
+            if data.len() < total_len {
+                return Ok(None);
+            }
+            let domain = std::str::from_utf8(&data[2..2 + domain_len])
+                .map_err(|e| std::io::Error::other(format!("invalid domain: {e}")))?;
+            let port = u16::from_be_bytes([data[2 + domain_len], data[3 + domain_len]]);
+            Ok(Some((
+                NetLocation::new(Address::Hostname(domain.to_string()), port),
+                total_len,
+            )))
+        }
+        _ => Err(std::io::Error::other(format!("unknown UoT AddrParser ATYP: {atyp}"))),
+    }
+}
+
+// NEW: Write AddrParser format
+#[inline]
+pub fn write_uot_addrparser_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(v4) => {
+            buf[0] = ADDRPARSER_ATYP_IPV4;
+            buf[1..5].copy_from_slice(&v4.ip().octets());
+            buf[5..7].copy_from_slice(&v4.port().to_be_bytes());
+            7
+        }
+        SocketAddr::V6(v6) => {
+            buf[0] = ADDRPARSER_ATYP_IPV6;
             buf[1..17].copy_from_slice(&v6.ip().octets());
             buf[17..19].copy_from_slice(&v6.port().to_be_bytes());
             19
@@ -204,5 +277,23 @@ mod tests {
         assert_eq!(buf[0], ATYP_IPV6);
         assert_eq!(&buf[1..17], &Ipv6Addr::LOCALHOST.octets());
         assert_eq!(&buf[17..19], &443u16.to_be_bytes());
+    }
+
+    // NEW: Tests for AddrParser format below
+    #[test]
+    fn test_parse_uot_addrparser_ipv4() {
+        let data = [ADDRPARSER_ATYP_IPV4, 192, 168, 1, 1, 0x1F, 0x90];
+        let (location, len) = parse_uot_addrparser_address(&data).unwrap().unwrap();
+        assert_eq!(len, 7);
+        assert_eq!(location.port(), 8080);
+    }
+
+    #[test]
+    fn test_write_uot_addrparser_ipv4() {
+        let addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
+        let mut buf = [0u8; 32];
+        let len = write_uot_addrparser_address(&mut buf, &addr);
+        assert_eq!(len, 7);
+        assert_eq!(buf[0], ADDRPARSER_ATYP_IPV4);
     }
 }
