@@ -45,10 +45,11 @@ jobs:
       - if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --locked
 
-      - name: Patch Source Code (Unlock Log Levels)
+      - name: Patch Source Code
         working-directory: shoes
         run: |
           sed -i -E 's/release_max_level_[a-zA-Z0-9_]*/release_max_level_trace/g' Cargo.toml
+          sed -i 's/Duration::from_secs(300)/Duration::from_secs(1800)/g' src/anytls/anytls_server_session.rs
 
       - name: Fetch and Replace UoT files
         working-directory: shoes
