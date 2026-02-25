@@ -29,9 +29,13 @@ use tokio::task::JoinHandle;
 /// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum lifetime for a single stream handler (5 minutes)
-/// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
-const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout for reading initial destination / UoT headers on a new stream
+/// Prevents half-open streams from hanging forever before routing starts.
+const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for route decision + outbound connect during stream setup
+/// Does NOT apply to the long-lived relay/copy phase.
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
@@ -400,27 +404,14 @@ impl AnyTlsSession {
                     let session_for_cleanup = Arc::clone(self);
 
                     let handle = tokio::spawn(async move {
-                        // Apply timeout to entire stream handler lifetime
-                        // This prevents memory leaks from hung streams
-                        let result = tokio::time::timeout(
-                            STREAM_HANDLER_TIMEOUT,
-                            session.handle_new_stream(stream),
-                        )
-                        .await;
-
-                        match result {
-                            Ok(Ok(())) => {
+                        // No global lifetime timeout here:
+                        // only stream setup phases are timeout-limited inside handle_new_stream().
+                        match session.handle_new_stream(stream).await {
+                            Ok(()) => {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
-                            }
-                            Err(_) => {
-                                log::warn!(
-                                    "AnyTLS stream {} timed out after {:?}",
-                                    stream_id_for_cleanup,
-                                    STREAM_HANDLER_TIMEOUT
-                                );
                             }
                         }
 
@@ -728,7 +719,16 @@ impl AnyTlsSession {
         let stream_id = stream.id();
 
         // Read destination address (SOCKS5 address format)
-        let destination = read_location_direct(&mut stream).await?;
+        let destination = match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await {
+            Ok(Ok(dest)) => dest,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
+                ));
+            }
+        };
 
         log::debug!(
             "AnyTLS stream {} (user: {}) -> {}",
@@ -758,10 +758,20 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let action = self
-            .proxy_provider
-            .judge(destination.clone().into(), &self.resolver)
-            .await?;
+        let action = match tokio::time::timeout(
+            STREAM_CONNECT_TIMEOUT,
+            self.proxy_provider.judge(destination.clone().into(), &self.resolver),
+        )
+        .await
+        {
+            Ok(Ok(action)) => action,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let error_msg = format!("route decision timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
+            }
+        };
 
         match action {
             ConnectDecision::Allow {
@@ -775,16 +785,23 @@ impl AnyTlsSession {
                 );
 
                 // Connect through the proxy chain
-                let client_result = match chain_group
-                    .connect_tcp(remote_location, &self.resolver)
-                    .await
+                let client_result = match tokio::time::timeout(
+                    STREAM_CONNECT_TIMEOUT,
+                    chain_group.connect_tcp(remote_location, &self.resolver),
+                )
+                .await
                 {
-                    Ok(result) => result,
-                    Err(e) => {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => {
                         // Send SYNACK with error message (protocol v2)
                         let error_msg = format!("connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
+                    }
+                    Err(_) => {
+                        let error_msg = format!("connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
                     }
                 };
                 let mut client_stream = client_result.client_stream;
@@ -842,8 +859,27 @@ impl AnyTlsSession {
         }
 
         // Read UoT V2 request header: isConnect(u8) + destination(SOCKS5 format)
-        let is_connect = stream.read_u8().await?;
-        let destination = read_location_direct(&mut stream).await?;
+        let is_connect = match tokio::time::timeout(STREAM_INIT_TIMEOUT, stream.read_u8()).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("UoT header read timed out after {:?}", STREAM_INIT_TIMEOUT),
+                ));
+            }
+        };
+
+        let destination = match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await {
+            Ok(Ok(dest)) => dest,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    io::ErrorKind::TimedOut,
+                ));
+            }
+        };
 
         log::debug!(
             "AnyTLS stream {} UoT V2 (user: {}, connect={}) -> {}",
@@ -896,10 +932,20 @@ impl AnyTlsSession {
         let stream_id = stream.id();
 
         // Use ClientProxySelector for routing
-        let action = self
-            .proxy_provider
-            .judge(destination.clone().into(), &self.resolver)
-            .await?;
+        let action = match tokio::time::timeout(
+            STREAM_CONNECT_TIMEOUT,
+            self.proxy_provider.judge(destination.clone().into(), &self.resolver),
+        )
+        .await
+        {
+            Ok(Ok(action)) => action,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let error_msg = format!("UDP route decision timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
+            }
+        };
 
         match action {
             ConnectDecision::Allow {
@@ -917,19 +963,26 @@ impl AnyTlsSession {
                     Box::new(VlessMessageStream::new(stream));
 
                 // Connect through the proxy chain
-                let client_stream = match chain_group
-                    .connect_udp_bidirectional(&self.resolver, remote_location)
-                    .await
+                let client_stream = match tokio::time::timeout(
+                    STREAM_CONNECT_TIMEOUT,
+                    chain_group.connect_udp_bidirectional(&self.resolver, remote_location),
+                )
+                .await
                 {
-                    Ok(result) => result,
-                    Err(e) => {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => {
                         // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
                     }
+                    Err(_) => {
+                        let error_msg = format!("UDP connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
+                    }
                 };
-
+                
                 // Send successful SYNACK (protocol v2)
                 let _ = self.send_synack(stream_id, None).await;
 
