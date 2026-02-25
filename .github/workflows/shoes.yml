@@ -36,7 +36,7 @@ jobs:
 
       - id: sha
         working-directory: shoes
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,11 +49,11 @@ jobs:
         working-directory: shoes
         run: |
           sed -i -E 's/release_max_level_[a-zA-Z0-9_]*/release_max_level_trace/g' Cargo.toml
-          sed -i 's/Duration::from_secs(300)/Duration::from_secs(1800)/g' src/anytls/anytls_server_session.rs
 
       - name: Fetch and Replace UoT files
         working-directory: shoes
         run: |
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_server_session.rs -o src/anytls/anytls_server_session.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_common.rs -o src/uot/uot_common.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_v1_server_stream.rs -o src/uot/uot_v1_server_stream.rs
 
