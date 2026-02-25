@@ -29,10 +29,9 @@ use tokio::task::JoinHandle;
 /// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Timeout for initial stream setup (reading destination/UoT header).
-/// This protects against half-open or malicious streams without killing
-/// healthy long-lived proxied connections.
-const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum lifetime for a single stream handler (5 minutes)
+/// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
+const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
@@ -394,21 +393,34 @@ impl AnyTlsSession {
                     }
                 };
 
-                // Handle the new stream internally (no fixed lifetime timeout)
+                // Handle the new stream internally with timeout and task tracking
                 if let Some(stream) = stream_opt {
                     let session = Arc::clone(self);
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
                     let handle = tokio::spawn(async move {
-                        let result = session.handle_new_stream(stream).await;
+                        // Apply timeout to entire stream handler lifetime
+                        // This prevents memory leaks from hung streams
+                        let result = tokio::time::timeout(
+                            STREAM_HANDLER_TIMEOUT,
+                            session.handle_new_stream(stream),
+                        )
+                        .await;
 
                         match result {
-                            Ok(()) => {
+                            Ok(Ok(())) => {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "AnyTLS stream {} timed out after {:?}",
+                                    stream_id_for_cleanup,
+                                    STREAM_HANDLER_TIMEOUT
+                                );
                             }
                         }
 
@@ -433,7 +445,11 @@ impl AnyTlsSession {
                 // Handle SYNACK - for now just log
                 if !frame.data.is_empty() {
                     let error_msg = String::from_utf8_lossy(&frame.data);
-                    log::warn!("Stream {} error from server: {}", frame.stream_id, error_msg);
+                    log::warn!(
+                        "Stream {} error from server: {}",
+                        frame.stream_id,
+                        error_msg
+                    );
                 } else {
                     log::debug!("Stream {} acknowledged", frame.stream_id);
                 }
@@ -441,21 +457,27 @@ impl AnyTlsSession {
 
             Command::Fin => {
                 // Stream close - remove from map first, then signal EOF
+                // This matches reference implementation and prevents races where
+                // new data arrives for a closing stream
                 let stream_tx = {
                     let mut streams = self.streams.write().await;
                     streams.remove(&frame.stream_id)
                 };
 
+                // Signal EOF to stream (empty bytes)
+                // Use async send for consistency, though FIN is typically not backpressured
                 if let Some(tx) = stream_tx {
                     let _ = tx.send(Bytes::new()).await;
                 }
             }
 
             Command::Waste => {
+                // Padding - just discard
                 log::trace!("Received {} bytes of padding", frame.data.len());
             }
 
             Command::Settings => {
+                // Client settings (server side)
                 if self.is_client {
                     return Ok(());
                 }
@@ -464,10 +486,12 @@ impl AnyTlsSession {
 
                 let settings = StringMap::from_bytes(&frame.data);
 
+                // Check padding-md5
                 if settings
                     .get("padding-md5")
                     .is_some_and(|client_md5| client_md5 != self.padding.md5())
                 {
+                    // Send updated padding scheme
                     let update_frame = Frame::with_data(
                         Command::UpdatePaddingScheme,
                         0,
@@ -476,6 +500,7 @@ impl AnyTlsSession {
                     self.write_control_frame(&update_frame).await?;
                 }
 
+                // Check client version
                 if let Some(v) = settings
                     .get("v")
                     .and_then(|s| s.parse::<u8>().ok())
@@ -483,6 +508,7 @@ impl AnyTlsSession {
                 {
                     self.peer_version.store(v, Ordering::Relaxed);
 
+                    // Send server settings
                     let mut server_settings = StringMap::new();
                     server_settings.insert("v", "2");
                     let settings_frame = Frame::with_data(
@@ -495,6 +521,7 @@ impl AnyTlsSession {
             }
 
             Command::ServerSettings => {
+                // Server settings (client side)
                 if !self.is_client {
                     return Ok(());
                 }
@@ -506,24 +533,29 @@ impl AnyTlsSession {
             }
 
             Command::UpdatePaddingScheme => {
+                // Server updates padding scheme (client side)
                 if !self.is_client {
                     return Ok(());
                 }
                 log::info!("Received padding scheme update from server");
+                // Note: In a full implementation, we'd update the padding factory here
             }
 
             Command::Alert => {
+                // Alert - fatal error
                 let msg = String::from_utf8_lossy(&frame.data);
                 log::error!("Received alert: {}", msg);
                 return Err(io::Error::other(msg.to_string()));
             }
 
             Command::HeartRequest => {
+                // Send heart response
                 let response = Frame::control(Command::HeartResponse, frame.stream_id);
                 self.write_control_frame(&response).await?;
             }
 
             Command::HeartResponse => {
+                // Heartbeat response - just acknowledge
                 log::trace!("Received heartbeat response");
             }
         }
@@ -533,19 +565,23 @@ impl AnyTlsSession {
 
     /// Write a frame to the connection with padding applied
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
+        // Use reusable write buffer to avoid allocation
         let mut write_buf = self.write_buf.lock().await;
         write_buf.clear();
         frame.encode_into(&mut write_buf);
 
+        // Handle buffering
         if self.buffering.load(Ordering::Relaxed) {
             let mut buffer = self.buffer.lock().await;
             buffer.extend_from_slice(&write_buf);
             return Ok(());
         }
 
+        // Flush any buffered data
         {
             let mut buffer = self.buffer.lock().await;
             if !buffer.is_empty() {
+                // Prepend buffered data
                 let mut combined = BytesMut::from(&buffer[..]);
                 combined.extend_from_slice(&write_buf);
                 write_buf.clear();
@@ -554,10 +590,14 @@ impl AnyTlsSession {
             }
         }
 
+        // Apply padding if enabled
         if self.send_padding.load(Ordering::Relaxed) {
+            // Use fetch_add + 1 to match Go's Add() semantics (returns new value)
+            // This ensures packets 1-7 get padded (not 0-7), matching reference implementations
             let pkt = self.pkt_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
             if pkt < self.padding.stop() {
+                // Need to take ownership for padding function
                 let data = write_buf.split();
                 return self.write_with_padding(data, pkt).await;
             } else {
@@ -565,6 +605,7 @@ impl AnyTlsSession {
             }
         }
 
+        // Write directly
         let mut writer = self.writer.lock().await;
         writer.write_all(&write_buf).await?;
         writer.flush().await
@@ -586,6 +627,7 @@ impl AnyTlsSession {
             let remain_payload_len = data.len();
 
             if size == CHECK_MARK {
+                // Check mark: stop if no more data
                 if remain_payload_len == 0 {
                     break;
                 }
@@ -595,32 +637,38 @@ impl AnyTlsSession {
             let size = size as usize;
 
             if remain_payload_len > size {
+                // This packet is all payload - send exactly `size` bytes
                 writer.write_all(&data[..size]).await?;
                 data = data.split_off(size);
             } else if remain_payload_len > 0 {
+                // This packet contains payload + padding
                 let padding_len = size.saturating_sub(remain_payload_len + FRAME_HEADER_SIZE);
 
                 if padding_len > 0 {
+                    // Append padding frame directly to data buffer (no intermediate allocation)
                     data.reserve(FRAME_HEADER_SIZE + padding_len);
                     data.put_u8(Command::Waste as u8);
-                    data.put_u32(0);
+                    data.put_u32(0); // stream_id = 0
                     data.put_u16(padding_len as u16);
-                    data.put_bytes(0, padding_len);
+                    data.put_bytes(0, padding_len); // Zero-fill without allocation
                 }
 
                 writer.write_all(&data).await?;
                 data.clear();
             } else {
+                // This packet is all padding - write directly without intermediate buffer
+                // Use a small stack buffer for the header
                 let header = [
                     Command::Waste as u8,
                     0,
                     0,
                     0,
-                    0,
+                    0, // stream_id = 0
                     (size >> 8) as u8,
                     size as u8,
                 ];
                 writer.write_all(&header).await?;
+                // Write zeros for padding body - use a static buffer for small sizes
                 const ZERO_BUF: [u8; 1024] = [0u8; 1024];
                 let mut remaining = size;
                 while remaining > 0 {
@@ -631,6 +679,7 @@ impl AnyTlsSession {
             }
         }
 
+        // Write any remaining payload
         if !data.is_empty() {
             writer.write_all(&data).await?;
         }
@@ -654,6 +703,9 @@ impl AnyTlsSession {
     }
 
     /// Write a control frame with timeout
+    ///
+    /// Control frames (Settings, Alert, SYNACK, etc.) should complete quickly.
+    /// If they timeout, the connection is likely dead and should be closed.
     async fn write_control_frame(&self, frame: &Frame) -> io::Result<()> {
         match tokio::time::timeout(CONTROL_FRAME_TIMEOUT, self.write_frame(frame)).await {
             Ok(result) => result,
@@ -675,15 +727,8 @@ impl AnyTlsSession {
     async fn handle_new_stream(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
-        // Read destination address (SOCKS5 address format) with setup timeout.
-        let destination = tokio::time::timeout(STREAM_SETUP_TIMEOUT, read_location_direct(&mut stream))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "AnyTLS stream setup timed out while reading destination",
-                )
-            })??;
+        // Read destination address (SOCKS5 address format)
+        let destination = read_location_direct(&mut stream).await?;
 
         log::debug!(
             "AnyTLS stream {} (user: {}) -> {}",
@@ -692,6 +737,7 @@ impl AnyTlsSession {
             destination
         );
 
+        // Check for UoT magic addresses
         if let Address::Hostname(host) = destination.address() {
             if host == UOT_V2_MAGIC_ADDRESS {
                 return self.handle_uot_v2(stream).await;
@@ -700,6 +746,7 @@ impl AnyTlsSession {
             }
         }
 
+        // Regular TCP forwarding with proper routing
         self.handle_tcp_forward(stream, destination).await
     }
 
@@ -727,9 +774,14 @@ impl AnyTlsSession {
                     remote_location
                 );
 
-                let client_result = match chain_group.connect_tcp(remote_location, &self.resolver).await {
+                // Connect through the proxy chain
+                let client_result = match chain_group
+                    .connect_tcp(remote_location, &self.resolver)
+                    .await
+                {
                     Ok(result) => result,
                     Err(e) => {
+                        // Send SYNACK with error message (protocol v2)
                         let error_msg = format!("connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
@@ -737,13 +789,17 @@ impl AnyTlsSession {
                 };
                 let mut client_stream = client_result.client_stream;
 
+                // Send successful SYNACK (protocol v2)
                 if let Err(e) = self.send_synack(stream_id, None).await {
                     log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
+                    // Continue anyway - client may be v1
                 }
 
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
-                let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
+                // Bidirectional copy
+                let result =
+                    copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
                 let _ = stream.shutdown().await;
                 let _ = client_stream.shutdown().await;
@@ -757,6 +813,7 @@ impl AnyTlsSession {
                 result
             }
             ConnectDecision::Block => {
+                // Send SYNACK with error (protocol v2)
                 let error_msg = format!("blocked by rules: {}", destination);
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
 
@@ -785,19 +842,8 @@ impl AnyTlsSession {
         }
 
         // Read UoT V2 request header: isConnect(u8) + destination(SOCKS5 format)
-        // Protect setup phase only; do not impose a lifetime timeout on the stream.
-        let (is_connect, destination) = tokio::time::timeout(STREAM_SETUP_TIMEOUT, async {
-            let is_connect = stream.read_u8().await?;
-            let destination = read_location_direct(&mut stream).await?;
-            Ok::<_, io::Error>((is_connect, destination))
-        })
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "AnyTLS UoT V2 setup timed out while reading request header",
-            )
-        })??;
+        let is_connect = stream.read_u8().await?;
+        let destination = read_location_direct(&mut stream).await?;
 
         log::debug!(
             "AnyTLS stream {} UoT V2 (user: {}, connect={}) -> {}",
@@ -808,8 +854,10 @@ impl AnyTlsSession {
         );
 
         if is_connect == 1 {
+            // V2 Connect Mode: Single destination, length-prefixed packets
             self.handle_uot_v2_connect(stream, destination).await
         } else {
+            // V2 Non-Connect: Same as V1 (multi-destination)
             self.handle_uot_multi_destination(stream).await
         }
     }
@@ -838,6 +886,8 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT V2 Connect Mode (single destination)
+    ///
+    /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
         stream: AnyTlsStream,
@@ -845,6 +895,7 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
+        // Use ClientProxySelector for routing
         let action = self
             .proxy_provider
             .judge(destination.clone().into(), &self.resolver)
@@ -861,25 +912,30 @@ impl AnyTlsSession {
                     remote_location
                 );
 
+                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
                 let server_stream: Box<dyn AsyncMessageStream> =
                     Box::new(VlessMessageStream::new(stream));
 
+                // Connect through the proxy chain
                 let client_stream = match chain_group
                     .connect_udp_bidirectional(&self.resolver, remote_location)
                     .await
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
                     }
                 };
 
+                // Send successful SYNACK (protocol v2)
                 let _ = self.send_synack(stream_id, None).await;
 
                 log::debug!("AnyTLS stream {} UoT V2 connect: connected", stream_id);
 
+                // Run UDP copy
                 let result = run_udp_copy(server_stream, client_stream, false, false).await;
 
                 if let Err(e) = &result {
@@ -891,7 +947,10 @@ impl AnyTlsSession {
                 result
             }
             ConnectDecision::Block => {
-                let _ = self.send_synack(stream_id, Some("UDP blocked by rules")).await;
+                // Send SYNACK with error (protocol v2)
+                let _ = self
+                    .send_synack(stream_id, Some("UDP blocked by rules"))
+                    .await;
 
                 log::warn!(
                     "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
@@ -907,6 +966,8 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)
+    ///
+    /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_multi_destination(&self, stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
@@ -915,16 +976,19 @@ impl AnyTlsSession {
             stream_id
         );
 
+        // Wrap AnyTlsStream as AsyncTargetedMessageStream (UotV1ServerStream)
         let server_stream: Box<dyn AsyncTargetedMessageStream> =
             Box::new(UotV1ServerStream::new(stream));
 
+        // Send successful SYNACK (protocol v2)
         let _ = self.send_synack(stream_id, None).await;
 
+        // Run per-destination routing
         let result = run_udp_routing(
             ServerStream::Targeted(server_stream),
             self.proxy_provider.clone(),
             self.resolver.clone(),
-            false,
+            false, // no initial flush needed
         )
         .await;
 
@@ -996,6 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_frame_types() {
+        // Test all control frame types
         for (cmd, expected_byte) in [
             (Command::Waste, 0),
             (Command::Syn, 1),
@@ -1030,6 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_streams_frame_interleaving() {
+        // Simulate multiple streams sending data - verify framing isolation
         let stream1_data = Frame::data(1, Bytes::from("stream1-data"));
         let stream2_data = Frame::data(2, Bytes::from("stream2-data"));
         let stream3_data = Frame::data(3, Bytes::from("stream3-data"));
@@ -1039,6 +1105,7 @@ mod tests {
         combined.extend_from_slice(&stream2_data.encode());
         combined.extend_from_slice(&stream3_data.encode());
 
+        // Decode all frames
         let f1 = FrameCodec::decode(&mut combined).unwrap().unwrap();
         let f2 = FrameCodec::decode(&mut combined).unwrap().unwrap();
         let f3 = FrameCodec::decode(&mut combined).unwrap().unwrap();
@@ -1053,6 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fin_and_syn_sequence() {
+        // Test SYN -> PSH -> FIN sequence
         let syn = Frame::control(Command::Syn, 1);
         let data = Frame::data(1, Bytes::from("payload"));
         let fin = Frame::control(Command::Fin, 1);
@@ -1088,6 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_frame() {
+        // Test frame with max-ish size (16KB)
         let large_data = vec![0xABu8; 16384];
         let frame = Frame::data(99, Bytes::from(large_data.clone()));
         let encoded = frame.encode();
@@ -1102,13 +1171,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_frame_decode() {
+        // Test that partial frames don't decode until complete
         let frame = Frame::data(1, Bytes::from("complete"));
         let encoded = frame.encode();
 
-        let mut partial = BytesMut::from(&encoded[..5]);
+        // Only provide partial data
+        let mut partial = BytesMut::from(&encoded[..5]); // Only header partial
         let result = FrameCodec::decode(&mut partial).unwrap();
         assert!(result.is_none());
 
+        // Add remaining data
         partial.extend_from_slice(&encoded[5..]);
         let decoded = FrameCodec::decode(&mut partial).unwrap().unwrap();
         assert_eq!(decoded.data.as_ref(), b"complete");
@@ -1116,6 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_waste_frame_padding() {
+        // Test padding frame
         let padding_data = vec![0u8; 100];
         let waste = Frame::with_data(Command::Waste, 0, Bytes::from(padding_data.clone()));
         let encoded = waste.encode();
@@ -1139,9 +1212,11 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send SYN without Settings first
         let syn_frame = Frame::control(Command::Syn, 1);
         server.write_all(&syn_frame.encode()).await.unwrap();
 
+        // Should receive Alert
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
@@ -1166,6 +1241,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings first
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1173,12 +1249,15 @@ mod tests {
             Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
         server.write_all(&settings_frame.encode()).await.unwrap();
 
+        // Wait for and consume the ServerSettings response
         let mut buf = vec![0u8; 128];
         let _ = timeout(Duration::from_millis(200), server.read(&mut buf)).await;
 
+        // Send heartbeat request
         let heart_request = Frame::control(Command::HeartRequest, 0);
         server.write_all(&heart_request.encode()).await.unwrap();
 
+        // Should receive heartbeat response
         let mut response_buf = vec![0u8; 16];
         let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
 
@@ -1192,14 +1271,17 @@ mod tests {
         run_task.abort();
     }
 
+    // ===== Frame parsing edge case tests =====
+
     #[test]
     fn test_frame_zero_length_data() {
         let frame = Frame::data(1, Bytes::new());
         let encoded = frame.encode();
 
-        assert_eq!(encoded.len(), FRAME_HEADER_SIZE);
+        assert_eq!(encoded.len(), FRAME_HEADER_SIZE); // Just header, no data
         assert_eq!(encoded[0], Command::Psh as u8);
 
+        // Decode should work
         let mut buf = BytesMut::from(&encoded[..]);
         let decoded = FrameCodec::decode(&mut buf).unwrap().unwrap();
         assert!(decoded.data.is_empty());
@@ -1217,6 +1299,7 @@ mod tests {
 
     #[test]
     fn test_frame_decode_incomplete_header() {
+        // Less than 7 bytes
         let mut buf = BytesMut::from(&[0x00, 0x00, 0x00][..]);
         let result = FrameCodec::decode(&mut buf).unwrap();
         assert!(result.is_none());
@@ -1224,11 +1307,12 @@ mod tests {
 
     #[test]
     fn test_frame_decode_incomplete_data() {
+        // Header says 100 bytes of data, but only 50 provided
         let mut buf = BytesMut::with_capacity(64);
-        buf.extend_from_slice(&[Command::Psh as u8]);
-        buf.extend_from_slice(&[0, 0, 0, 1]);
-        buf.extend_from_slice(&[0, 100]);
-        buf.extend_from_slice(&[0u8; 50]);
+        buf.extend_from_slice(&[Command::Psh as u8]); // cmd
+        buf.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
+        buf.extend_from_slice(&[0, 100]); // length = 100
+        buf.extend_from_slice(&[0u8; 50]); // only 50 bytes of data
 
         let result = FrameCodec::decode(&mut buf).unwrap();
         assert!(result.is_none());
@@ -1236,10 +1320,11 @@ mod tests {
 
     #[test]
     fn test_frame_unknown_command_returns_error() {
+        // Command byte 255 is not defined
         let mut buf = BytesMut::with_capacity(16);
-        buf.extend_from_slice(&[255u8]);
-        buf.extend_from_slice(&[0, 0, 0, 1]);
-        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&[255u8]); // unknown cmd
+        buf.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
+        buf.extend_from_slice(&[0, 0]); // length = 0
 
         let result = FrameCodec::decode(&mut buf);
         assert!(result.is_err());
@@ -1271,10 +1356,12 @@ mod tests {
 
     #[test]
     fn test_frame_max_data_length() {
+        // Max u16 = 65535 bytes
         let large_data = vec![0xFFu8; 65535];
         let frame = Frame::data(1, Bytes::from(large_data.clone()));
         let encoded = frame.encode();
 
+        // Verify length field
         let len = u16::from_be_bytes([encoded[5], encoded[6]]);
         assert_eq!(len, 65535);
 
@@ -1282,6 +1369,8 @@ mod tests {
         let decoded = FrameCodec::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.data.len(), 65535);
     }
+
+    // ===== Session protocol edge case tests =====
 
     #[tokio::test]
     async fn test_session_psh_for_nonexistent_stream() {
@@ -1294,6 +1383,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1303,9 +1393,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Send PSH for stream 999 (never opened)
+        // This should NOT crash the session
         let psh = Frame::data(999, Bytes::from("orphan data"));
         server.write_all(&psh.encode()).await.unwrap();
 
+        // Session should still be alive - send heartbeat to verify
         tokio::time::sleep(Duration::from_millis(100)).await;
         let heart = Frame::control(Command::HeartRequest, 0);
         let result = server.write_all(&heart.encode()).await;
@@ -1326,6 +1419,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1335,9 +1429,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Send FIN for stream 999 (never opened)
+        // Should be gracefully ignored
         let fin = Frame::control(Command::Fin, 999);
         server.write_all(&fin.encode()).await.unwrap();
 
+        // Session should still be alive
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!session.is_closed());
 
@@ -1356,6 +1453,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1365,10 +1463,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Send waste (padding) frame with data
         let padding_data = vec![0u8; 500];
         let waste = Frame::with_data(Command::Waste, 0, Bytes::from(padding_data));
         server.write_all(&waste.encode()).await.unwrap();
 
+        // Session should still function
         tokio::time::sleep(Duration::from_millis(100)).await;
         let syn = Frame::control(Command::Syn, 1);
         let result = server.write_all(&syn.encode()).await;
@@ -1389,6 +1489,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings with mismatched padding MD5
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", "different_md5_value");
@@ -1396,11 +1497,14 @@ mod tests {
             Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
         server.write_all(&settings_frame.encode()).await.unwrap();
 
+        // Should receive UpdatePaddingScheme frame
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
         if let Ok(Ok(n)) = result {
             if n >= 7 {
+                // Could be ServerSettings or UpdatePaddingScheme
+                // Either is valid response
                 let cmd = buf[0];
                 assert!(
                     cmd == Command::UpdatePaddingScheme as u8
@@ -1424,6 +1528,7 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
+        // Send settings first
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1433,14 +1538,18 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Send Alert from client
         let alert = Frame::with_data(Command::Alert, 0, Bytes::from("client error"));
         server.write_all(&alert.encode()).await.unwrap();
 
+        // Session should close
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(session.is_closed());
 
         run_task.abort();
     }
+
+    // ===== StringMap tests =====
 
     #[test]
     fn test_stringmap_roundtrip() {
@@ -1470,12 +1579,15 @@ mod tests {
     #[test]
     fn test_stringmap_newlines_in_values() {
         let mut map = StringMap::new();
-        map.insert("multiline", "line1\nline2");
+        map.insert("multiline", "line1\nline2"); // Should not break parsing
 
         let bytes = map.to_bytes();
         let parsed = StringMap::from_bytes(&bytes);
 
+        // With newlines, parsing may be affected
+        // This test documents current behavior
         let val = parsed.get("multiline");
+        // Value may be truncated at newline
         assert!(val.is_none() || val == Some(&"line1".to_string()));
     }
 
