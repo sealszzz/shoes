@@ -35,7 +35,7 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Timeout for route decision + outbound connect during stream setup
 /// Does NOT apply to the long-lived relay/copy phase.
-const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
@@ -718,11 +718,14 @@ impl AnyTlsSession {
     async fn handle_new_stream(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
+        log::trace!("AnyTLS stream {} setup started", stream_id);
+
         // Read destination address (SOCKS5 address format)
         let destination = match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await {
             Ok(Ok(dest)) => dest,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                let _ = stream.shutdown().await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -847,11 +850,13 @@ impl AnyTlsSession {
     /// Handle UoT V2 stream (sp.v2.udp-over-tcp.arpa)
     async fn handle_uot_v2(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
+        log::trace!("AnyTLS stream {} UoT V2 setup started", stream_id);
         if !self.udp_enabled {
             log::debug!(
                 "AnyTLS stream {} UoT V2 rejected: UDP not enabled",
                 stream_id
             );
+            let _ = stream.shutdown().await;
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UDP not enabled for AnyTLS",
@@ -863,6 +868,7 @@ impl AnyTlsSession {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                let _ = stream.shutdown().await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("UoT header read timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -874,9 +880,10 @@ impl AnyTlsSession {
             Ok(Ok(dest)) => dest,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                let _ = stream.shutdown().await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    io::ErrorKind::TimedOut,
+                    format!("UoT destination read timed out after {:?}", STREAM_INIT_TIMEOUT),
                 ));
             }
         };
@@ -901,11 +908,13 @@ impl AnyTlsSession {
     /// Handle UoT V1 stream (sp.udp-over-tcp.arpa) - multi-destination mode
     async fn handle_uot_v1(&self, stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
+        log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
         if !self.udp_enabled {
             log::debug!(
                 "AnyTLS stream {} UoT V1 rejected: UDP not enabled",
                 stream_id
             );
+            let _ = stream.shutdown().await;
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UDP not enabled for AnyTLS",
@@ -1004,6 +1013,7 @@ impl AnyTlsSession {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
+                let _ = stream.shutdown().await;
 
                 log::warn!(
                     "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
