@@ -906,7 +906,7 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT V1 stream (sp.udp-over-tcp.arpa) - multi-destination mode
-    async fn handle_uot_v1(&self, stream: AnyTlsStream) -> io::Result<()> {
+    async fn handle_uot_v1(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
         log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
         if !self.udp_enabled {
@@ -935,7 +935,7 @@ impl AnyTlsSession {
     /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
-        stream: AnyTlsStream,
+        mut stream: AnyTlsStream,
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
