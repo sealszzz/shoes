@@ -744,8 +744,27 @@ impl AnyTlsSession {
         if let Address::Hostname(host) = destination.address() {
             if host == UOT_V2_MAGIC_ADDRESS {
                 return self.handle_uot_v2(stream).await;
-            } else if host == UOT_V1_MAGIC_ADDRESS {
-                return self.handle_uot_v1(stream).await;
+            }
+
+            if host == UOT_V1_MAGIC_ADDRESS {
+                let msg = "legacy UoT V1 is not supported by AnyTLS protocol spec";
+
+                log::warn!(
+                    "AnyTLS stream {} rejected legacy UoT V1 target: {}",
+                    stream_id,
+                    host
+                );
+
+                // Protocol violation: send Alert and return an error.
+                // The outer session cleanup path will close the connection.
+                let alert_frame =
+                    Frame::with_data(Command::Alert, 0, Bytes::from_static(msg.as_bytes()));
+                if let Err(e) = self.write_control_frame(&alert_frame).await {
+                    log::debug!("Failed to send Alert for legacy UoT V1: {}", e);
+                }
+                let _ = stream.shutdown().await;
+
+                return Err(io::Error::new(io::ErrorKind::Unsupported, msg));
             }
         }
 
@@ -905,31 +924,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle UoT V1 stream (sp.udp-over-tcp.arpa) - multi-destination mode
-    async fn handle_uot_v1(&self, mut stream: AnyTlsStream) -> io::Result<()> {
-        let stream_id = stream.id();
-        log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
-        if !self.udp_enabled {
-            log::debug!(
-                "AnyTLS stream {} UoT V1 rejected: UDP not enabled",
-                stream_id
-            );
-            let _ = stream.shutdown().await;
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "UDP not enabled for AnyTLS",
-            ));
-        }
-
-        log::debug!(
-            "AnyTLS stream {} UoT V1 (user: {})",
-            stream_id,
-            self.user_name
-        );
-
-        self.handle_uot_multi_destination(stream).await
-    }
-
     /// Handle UoT V2 Connect Mode (single destination)
     ///
     /// Uses connect_udp for proper proxy chaining support.
@@ -948,10 +942,19 @@ impl AnyTlsSession {
         .await
         {
             Ok(Ok(action)) => action,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let error_msg = format!("UDP route decision timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+            Ok(Err(e)) => {
+                let error_msg = format!("UDP route decision failed: {}", e);
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                let _ = stream.shutdown().await;
+                return Err(e);
+            }
+            Err(_) => {
+                let error_msg = format!(
+                    "UDP route decision timed out after {:?}",
+                    STREAM_CONNECT_TIMEOUT
+                );
+                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                let _ = stream.shutdown().await;
                 return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
             }
         };
@@ -983,15 +986,20 @@ impl AnyTlsSession {
                         // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                        let _ = stream.shutdown().await;
                         return Err(e);
                     }
                     Err(_) => {
-                        let error_msg = format!("UDP connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                        let error_msg = format!(
+                            "UDP connect timed out after {:?}",
+                            STREAM_CONNECT_TIMEOUT
+                        );
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                        let _ = stream.shutdown().await;
                         return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
                     }
                 };
-                
+
                 // Send successful SYNACK (protocol v2)
                 let _ = self.send_synack(stream_id, None).await;
 
