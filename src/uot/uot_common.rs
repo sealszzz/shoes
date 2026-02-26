@@ -1,14 +1,16 @@
-//! Common address parsing and writing utilities for UoT-related address formats.
+//! Common address parsing utilities for UoT and h2mux packet-address mode.
 //!
-//! This module implements two address serialization formats used by sing-box UoT:
+//! ## Supported address formats
 //!
-//! 1. **SOCKS5-style address format**
+//! This module implements two different wire formats used by sing-box:
+//!
+//! 1. **SOCKS5 address format**
 //!    - `0x01`: IPv4
 //!    - `0x03`: Domain
 //!    - `0x04`: IPv6
 //!    - Used by:
-//!      - UoT request headers (`M.SocksaddrSerializer`)
 //!      - h2mux packet_addr mode
+//!      - UoT V2 request headers
 //!
 //! 2. **AddrParser format**
 //!    - `0x00`: IPv4
@@ -17,34 +19,28 @@
 //!    - Used by:
 //!      - UoT V1 packet payloads
 //!      - UoT V2 non-connect packet payloads
-//!
-//! These formats are distinct and are not interchangeable.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// SOCKS5 ATYP value for IPv4.
+/// SOCKS5 ATYP values.
 pub const ATYP_IPV4: u8 = 0x01;
-/// SOCKS5 ATYP value for domain names.
 pub const ATYP_DOMAIN: u8 = 0x03;
-/// SOCKS5 ATYP value for IPv6.
 pub const ATYP_IPV6: u8 = 0x04;
 
-/// AddrParser ATYP value for IPv4.
+/// AddrParser ATYP values.
 pub const ADDRPARSER_ATYP_IPV4: u8 = 0x00;
-/// AddrParser ATYP value for IPv6.
 pub const ADDRPARSER_ATYP_IPV6: u8 = 0x01;
-/// AddrParser ATYP value for domain names.
 pub const ADDRPARSER_ATYP_DOMAIN: u8 = 0x02;
 
-/// Parse a SOCKS5-style UoT address: `ATYP + address + port`.
+/// Parse a SOCKS5-format UoT address: `ATYP + address + port`.
 ///
 /// Returns:
-/// - `Ok(Some((location, bytes_consumed)))` if a full address was parsed
+/// - `Ok(Some((location, bytes_consumed)))` if a full address is available
 /// - `Ok(None)` if more bytes are needed
-/// - `Err(_)` if the input is invalid
+/// - `Err(_)` if the data is malformed
 #[inline]
 pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
@@ -54,7 +50,6 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
     let atyp = data[0];
     match atyp {
         ATYP_IPV4 => {
-            // ATYP(1) + IPv4(4) + Port(2) = 7
             if data.len() < 7 {
                 return Ok(None);
             }
@@ -63,7 +58,6 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
             Ok(Some((NetLocation::new(Address::Ipv4(ip), port), 7)))
         }
         ATYP_IPV6 => {
-            // ATYP(1) + IPv6(16) + Port(2) = 19
             if data.len() < 19 {
                 return Ok(None);
             }
@@ -73,7 +67,6 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
             Ok(Some((NetLocation::new(Address::Ipv6(ip), port), 19)))
         }
         ATYP_DOMAIN => {
-            // ATYP(1) + DomainLen(1) + Domain(variable) + Port(2)
             if data.len() < 2 {
                 return Ok(None);
             }
@@ -94,11 +87,7 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
     }
 }
 
-/// Write a SOCKS5-style UoT address from `SocketAddr`.
-///
-/// Caller must provide a buffer large enough:
-/// - IPv4 requires 7 bytes
-/// - IPv6 requires 19 bytes
+/// Write a SOCKS5-format UoT address: `ATYP + address + port`.
 ///
 /// Returns the number of bytes written.
 #[inline]
@@ -119,12 +108,12 @@ pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     }
 }
 
-/// Parse an AddrParser-style UoT address: `ATYP + address + port`.
+/// Parse an AddrParser-format address: `ATYP + address + port`.
 ///
 /// Returns:
-/// - `Ok(Some((location, bytes_consumed)))` if a full address was parsed
+/// - `Ok(Some((location, bytes_consumed)))` if a full address is available
 /// - `Ok(None)` if more bytes are needed
-/// - `Err(_)` if the input is invalid
+/// - `Err(_)` if the data is malformed
 #[inline]
 pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
@@ -134,7 +123,6 @@ pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocati
     let atyp = data[0];
     match atyp {
         ADDRPARSER_ATYP_IPV4 => {
-            // ATYP(1) + IPv4(4) + Port(2) = 7
             if data.len() < 7 {
                 return Ok(None);
             }
@@ -143,7 +131,6 @@ pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocati
             Ok(Some((NetLocation::new(Address::Ipv4(ip), port), 7)))
         }
         ADDRPARSER_ATYP_IPV6 => {
-            // ATYP(1) + IPv6(16) + Port(2) = 19
             if data.len() < 19 {
                 return Ok(None);
             }
@@ -153,7 +140,6 @@ pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocati
             Ok(Some((NetLocation::new(Address::Ipv6(ip), port), 19)))
         }
         ADDRPARSER_ATYP_DOMAIN => {
-            // ATYP(1) + DomainLen(1) + Domain(variable) + Port(2)
             if data.len() < 2 {
                 return Ok(None);
             }
@@ -176,11 +162,7 @@ pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocati
     }
 }
 
-/// Write an AddrParser-style UoT address from `SocketAddr`.
-///
-/// Caller must provide a buffer large enough:
-/// - IPv4 requires 7 bytes
-/// - IPv6 requires 19 bytes
+/// Write an AddrParser-format address: `ATYP + address + port`.
 ///
 /// Returns the number of bytes written.
 #[inline]
@@ -252,17 +234,11 @@ mod tests {
     fn test_parse_uot_truncated() {
         assert!(parse_uot_address(&[]).unwrap().is_none());
         assert!(parse_uot_address(&[ATYP_IPV4, 1, 2, 3]).unwrap().is_none());
-        assert!(
-            parse_uot_address(&[ATYP_IPV6, 0, 0, 0, 0])
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_uot_address(&[ATYP_IPV6, 0, 0, 0, 0]).unwrap().is_none());
         assert!(parse_uot_address(&[ATYP_DOMAIN]).unwrap().is_none());
-        assert!(
-            parse_uot_address(&[ATYP_DOMAIN, 10, b'a', b'b'])
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_uot_address(&[ATYP_DOMAIN, 10, b'a', b'b'])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -338,26 +314,18 @@ mod tests {
     #[test]
     fn test_parse_uot_addrparser_truncated() {
         assert!(parse_uot_addrparser_address(&[]).unwrap().is_none());
-        assert!(
-            parse_uot_addrparser_address(&[ADDRPARSER_ATYP_IPV4, 1, 2, 3])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_uot_addrparser_address(&[ADDRPARSER_ATYP_IPV6, 0, 0, 0, 0])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_uot_addrparser_address(&[ADDRPARSER_ATYP_DOMAIN])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_uot_addrparser_address(&[ADDRPARSER_ATYP_DOMAIN, 10, b'a', b'b'])
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_uot_addrparser_address(&[ADDRPARSER_ATYP_IPV4, 1, 2, 3])
+            .unwrap()
+            .is_none());
+        assert!(parse_uot_addrparser_address(&[ADDRPARSER_ATYP_IPV6, 0, 0, 0, 0])
+            .unwrap()
+            .is_none());
+        assert!(parse_uot_addrparser_address(&[ADDRPARSER_ATYP_DOMAIN])
+            .unwrap()
+            .is_none());
+        assert!(parse_uot_addrparser_address(&[ADDRPARSER_ATYP_DOMAIN, 10, b'a', b'b'])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
