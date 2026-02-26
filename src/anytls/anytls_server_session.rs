@@ -986,7 +986,6 @@ impl AnyTlsSession {
                         // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        let _ = stream.shutdown().await;
                         return Err(e);
                     }
                     Err(_) => {
@@ -995,7 +994,6 @@ impl AnyTlsSession {
                             STREAM_CONNECT_TIMEOUT
                         );
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        let _ = stream.shutdown().await;
                         return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
                     }
                 };
