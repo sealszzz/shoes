@@ -247,6 +247,15 @@ impl AnyTlsSession {
         // Run the receive loop
         let result = session.recv_loop().await;
 
+        match &result {
+            Ok(()) => {
+                log::debug!("AnyTLS session recv_loop ended normally");
+            }
+            Err(e) => {
+                log::warn!("AnyTLS session recv_loop ended with error: {}", e);
+            }
+        }
+
         // Cleanup
         session.close().await;
         outgoing_task.abort();
@@ -268,7 +277,13 @@ impl AnyTlsSession {
                 // Send FIN frame
                 let frame = Frame::control(Command::Fin, stream_id);
                 if let Err(e) = self.write_frame(&frame).await {
-                    log::debug!("Failed to send FIN for stream {}: {}", stream_id, e);
+                    log::warn!(
+                        "Failed to send FIN for stream {}: {}, closing session",
+                        stream_id,
+                        e
+                    );
+                    self.close().await;
+                    break;
                 }
 
                 // Remove stream from map
@@ -278,7 +293,12 @@ impl AnyTlsSession {
                 // Send data frame
                 let frame = Frame::data(stream_id, data);
                 if let Err(e) = self.write_frame(&frame).await {
-                    log::debug!("Failed to send data for stream {}: {}", stream_id, e);
+                    log::warn!(
+                        "Failed to send data for stream {}: {}, closing session",
+                        stream_id,
+                        e
+                    );
+                    self.close().await;
                     break;
                 }
             }
