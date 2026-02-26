@@ -721,7 +721,12 @@ impl AnyTlsSession {
         log::trace!("AnyTLS stream {} setup started", stream_id);
 
         // Read destination address (SOCKS5 address format)
-        let destination = match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await {
+        let destination = match tokio::time::timeout(
+            STREAM_INIT_TIMEOUT,
+            read_location_direct(&mut stream),
+        )
+        .await
+        {
             Ok(Ok(dest)) => dest,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -744,27 +749,8 @@ impl AnyTlsSession {
         if let Address::Hostname(host) = destination.address() {
             if host == UOT_V2_MAGIC_ADDRESS {
                 return self.handle_uot_v2(stream).await;
-            }
-
-            if host == UOT_V1_MAGIC_ADDRESS {
-                let msg = "legacy UoT V1 is not supported by AnyTLS protocol spec";
-
-                log::warn!(
-                    "AnyTLS stream {} rejected legacy UoT V1 target: {}",
-                    stream_id,
-                    host
-                );
-
-                // Protocol violation: send Alert and return an error.
-                // The outer session cleanup path will close the connection.
-                let alert_frame =
-                    Frame::with_data(Command::Alert, 0, Bytes::from_static(msg.as_bytes()));
-                if let Err(e) = self.write_control_frame(&alert_frame).await {
-                    log::debug!("Failed to send Alert for legacy UoT V1: {}", e);
-                }
-                let _ = stream.shutdown().await;
-
-                return Err(io::Error::new(io::ErrorKind::Unsupported, msg));
+            } else if host == UOT_V1_MAGIC_ADDRESS {
+                return self.handle_uot_v1(stream).await;
             }
         }
 
@@ -922,6 +908,31 @@ impl AnyTlsSession {
             // V2 Non-Connect: Same as V1 (multi-destination)
             self.handle_uot_multi_destination(stream).await
         }
+    }
+
+    /// Handle UoT V1 stream (sp.udp-over-tcp.arpa) - multi-destination mode
+    async fn handle_uot_v1(&self, mut stream: AnyTlsStream) -> io::Result<()> {
+        let stream_id = stream.id();
+        log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
+        if !self.udp_enabled {
+            log::debug!(
+                "AnyTLS stream {} UoT V1 rejected: UDP not enabled",
+                stream_id
+            );
+            let _ = stream.shutdown().await;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "UDP not enabled for AnyTLS",
+            ));
+        }
+
+        log::debug!(
+            "AnyTLS stream {} UoT V1 (user: {})",
+            stream_id,
+            self.user_name
+        );
+
+        self.handle_uot_multi_destination(stream).await
     }
 
     /// Handle UoT V2 Connect Mode (single destination)
