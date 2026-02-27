@@ -197,6 +197,28 @@ impl AnyTlsSession {
         self.is_closed.load(Ordering::Relaxed)
     }
 
+    fn is_benign_session_error(err: &io::Error) -> bool {
+        let s = err.to_string().to_ascii_lowercase();
+        s.contains("peer closed connection without sending tls close_notify")
+            || s.contains("unexpected eof")
+            || s.contains("stream closed")
+            || err.kind() == io::ErrorKind::UnexpectedEof
+            || err.kind() == io::ErrorKind::BrokenPipe
+            || err.kind() == io::ErrorKind::ConnectionReset
+            || err.kind() == io::ErrorKind::ConnectionAborted
+    }
+
+    fn is_benign_stream_error(err: &io::Error) -> bool {
+        let s = err.to_string().to_ascii_lowercase();
+        s.contains("stream closed")
+            || s.contains("peer closed connection without sending tls close_notify")
+            || s.contains("unexpected eof")
+            || err.kind() == io::ErrorKind::UnexpectedEof
+            || err.kind() == io::ErrorKind::BrokenPipe
+            || err.kind() == io::ErrorKind::ConnectionReset
+            || err.kind() == io::ErrorKind::ConnectionAborted
+    }
+
     /// Close the session
     pub async fn close(&self) {
         if self
@@ -269,7 +291,11 @@ impl AnyTlsSession {
                 log::debug!("AnyTLS session recv_loop ended normally");
             }
             Err(e) => {
-                log::warn!("AnyTLS session recv_loop ended with error: {}", e);
+                if Self::is_benign_session_error(e) {
+                    log::debug!("AnyTLS session recv_loop ended: {}", e);
+                } else {
+                    log::warn!("AnyTLS session recv_loop ended with error: {}", e);
+                }
             }
         }
 
@@ -332,7 +358,11 @@ impl AnyTlsSession {
 
             while let Some(frame) = FrameCodec::decode(&mut buffer)? {
                 if let Err(e) = self.handle_frame(frame).await {
-                    log::warn!("Error handling frame: {}", e);
+                    if Self::is_benign_session_error(&e) {
+                        log::debug!("Error handling frame: {}", e);
+                    } else {
+                        log::warn!("Error handling frame: {}", e);
+                    }
                     return Err(e);
                 }
             }
@@ -366,11 +396,7 @@ impl AnyTlsSession {
                 };
 
                 if let Some(tx) = tx {
-                    match tokio::time::timeout(
-                        STREAM_CHANNEL_SEND_TIMEOUT,
-                        tx.send(frame.data),
-                    )
-                    .await
+                    match tokio::time::timeout(STREAM_CHANNEL_SEND_TIMEOUT, tx.send(frame.data)).await
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(_)) => {
@@ -444,11 +470,19 @@ impl AnyTlsSession {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
                             Err(e) => {
-                                log::debug!(
-                                    "AnyTLS stream {} error: {}",
-                                    stream_id_for_cleanup,
-                                    e
-                                );
+                                if AnyTlsSession::is_benign_stream_error(&e) {
+                                    log::trace!(
+                                        "AnyTLS stream {} ended: {}",
+                                        stream_id_for_cleanup,
+                                        e
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "AnyTLS stream {} error: {}",
+                                        stream_id_for_cleanup,
+                                        e
+                                    );
+                                }
                             }
                         }
 
@@ -469,11 +503,7 @@ impl AnyTlsSession {
 
                 if !frame.data.is_empty() {
                     let error_msg = String::from_utf8_lossy(&frame.data);
-                    log::warn!(
-                        "Stream {} error from server: {}",
-                        frame.stream_id,
-                        error_msg
-                    );
+                    log::warn!("Stream {} error from server: {}", frame.stream_id, error_msg);
                 } else {
                     log::debug!("Stream {} acknowledged", frame.stream_id);
                 }
@@ -737,22 +767,19 @@ impl AnyTlsSession {
 
         log::trace!("AnyTLS stream {} setup started", stream_id);
 
-        let destination = match tokio::time::timeout(
-            STREAM_INIT_TIMEOUT,
-            read_location_direct(&mut stream),
-        )
-        .await
-        {
-            Ok(Ok(dest)) => dest,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let _ = stream.shutdown().await;
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
-                ));
-            }
-        };
+        let destination =
+            match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await
+            {
+                Ok(Ok(dest)) => dest,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
+                    ));
+                }
+            };
 
         log::debug!(
             "AnyTLS stream {} (user: {}) -> {}",
@@ -841,9 +868,13 @@ impl AnyTlsSession {
                 let _ = client_stream.shutdown().await;
 
                 if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} ended: {}", stream_id, e);
+                    if Self::is_benign_stream_error(e) {
+                        log::trace!("AnyTLS stream {} ended: {}", stream_id, e);
+                    } else {
+                        log::debug!("AnyTLS stream {} ended with error: {}", stream_id, e);
+                    }
                 } else {
-                    log::debug!("AnyTLS stream {} completed", stream_id);
+                    log::trace!("AnyTLS stream {} completed", stream_id);
                 }
 
                 result
@@ -890,22 +921,22 @@ impl AnyTlsSession {
             }
         };
 
-        let destination = match tokio::time::timeout(
-            STREAM_INIT_TIMEOUT,
-            read_location_direct(&mut stream),
-        )
-        .await
-        {
-            Ok(Ok(dest)) => dest,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let _ = stream.shutdown().await;
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("UoT destination read timed out after {:?}", STREAM_INIT_TIMEOUT),
-                ));
-            }
-        };
+        let destination =
+            match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await
+            {
+                Ok(Ok(dest)) => dest,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "UoT destination read timed out after {:?}",
+                            STREAM_INIT_TIMEOUT
+                        ),
+                    ));
+                }
+            };
 
         log::debug!(
             "AnyTLS stream {} UoT V2 (user: {}, connect={}) -> {}",
@@ -1026,9 +1057,17 @@ impl AnyTlsSession {
                 let result = run_udp_copy(server_stream, client_stream, false, false).await;
 
                 if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
+                    if Self::is_benign_stream_error(e) {
+                        log::trace!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
+                    } else {
+                        log::debug!(
+                            "AnyTLS stream {} UoT V2 connect ended with error: {}",
+                            stream_id,
+                            e
+                        );
+                    }
                 } else {
-                    log::debug!("AnyTLS stream {} UoT V2 connect completed", stream_id);
+                    log::trace!("AnyTLS stream {} UoT V2 connect completed", stream_id);
                 }
 
                 result
@@ -1075,9 +1114,17 @@ impl AnyTlsSession {
         .await;
 
         if let Err(e) = &result {
-            log::debug!("AnyTLS stream {} UoT multi-dest ended: {}", stream_id, e);
+            if Self::is_benign_stream_error(e) {
+                log::trace!("AnyTLS stream {} UoT multi-dest ended: {}", stream_id, e);
+            } else {
+                log::debug!(
+                    "AnyTLS stream {} UoT multi-dest ended with error: {}",
+                    stream_id,
+                    e
+                );
+            }
         } else {
-            log::debug!("AnyTLS stream {} UoT multi-dest completed", stream_id);
+            log::trace!("AnyTLS stream {} UoT multi-dest completed", stream_id);
         }
 
         result
