@@ -5,6 +5,10 @@
 //! | ATYP | address  | port  | length | data     |
 //! | u8   | variable | u16be | u16be  | variable |
 //! ```
+//!
+//! Note:
+//! - UoT V1 packet payloads use sing-box AddrParser address format
+//!   (`0x00/0x01/0x02`), not SOCKS5 (`0x01/0x03/0x04`).
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,7 +17,7 @@ use std::task::{Context, Poll};
 use futures::ready;
 use tokio::io::ReadBuf;
 
-use super::uot_common::{parse_uot_address, write_uot_address};
+use super::uot_common::{parse_uot_addrparser_address, write_uot_addrparser_address};
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
@@ -76,8 +80,8 @@ impl<S: AsyncStream> UotV1ServerStream<S> {
     fn try_parse_packet(&self) -> std::io::Result<Option<(NetLocation, usize, usize)>> {
         let data = self.read_buf.as_slice();
 
-        // Try to parse the address
-        let (location, addr_len) = match parse_uot_address(data)? {
+        // UoT V1 packet payload uses sing-box AddrParser format, not SOCKS5.
+        let (location, addr_len) = match parse_uot_addrparser_address(data)? {
             Some(result) => result,
             None => return Ok(None),
         };
@@ -145,7 +149,6 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
                         this.read_buf.len(),
                         preview
                     );
-                    // Need more data - continue below
                 }
             }
 
@@ -171,7 +174,6 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
                         return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
                     }
                     this.read_buf.advance_write(bytes_read);
-                    // Loop to try parsing again
                 }
                 Poll::Ready(Err(e)) => {
                     log::trace!("UotV1ServerStream: read error: {}", e);
@@ -225,8 +227,8 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
             ))));
         }
 
-        // Write UoT address format
-        let offset = write_uot_address(&mut this.write_buf, source);
+        // UoT V1 packet payload uses sing-box AddrParser format, not SOCKS5.
+        let offset = write_uot_addrparser_address(&mut this.write_buf, source);
 
         // Write length prefix (u16be)
         let len_bytes = (buf.len() as u16).to_be_bytes();
