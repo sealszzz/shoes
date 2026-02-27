@@ -37,6 +37,10 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Does NOT apply to the long-lived relay/copy phase.
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max time we're willing to let one stream backpressure stall recv_loop.
+/// If exceeded, we close that local stream to protect the whole session.
+const STREAM_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -132,11 +136,9 @@ impl AnyTlsSession {
             pkt_counter: AtomicU32::new(0),
             buffering: AtomicBool::new(false),
             buffer: Mutex::new(Vec::new()),
-            // Pre-allocate write buffer for max frame size (64KB + header + some margin)
             write_buf: Mutex::new(BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE + 64)),
             peer_version: AtomicU8::new(0),
             received_client_settings: AtomicBool::new(false),
-            // Stream handling dependencies (always required)
             resolver,
             proxy_provider,
             udp_enabled,
@@ -158,11 +160,8 @@ impl AnyTlsSession {
         use crate::resolver::NativeResolver;
 
         let (reader, writer) = tokio::io::split(conn);
-        // Use bounded channel for outgoing data to provide backpressure
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
 
-        // Create a "block all" proxy selector - tests that need real routing should
-        // use the full constructor with proper dependencies
         let proxy_provider = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
             vec![],
             crate::client_proxy_selector::ConnectAction::Block,
@@ -205,8 +204,6 @@ impl AnyTlsSession {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
-            // Abort all active stream handler tasks first
-            // This prevents memory leaks from hung tasks holding Arc<Self>
             {
                 let mut tasks = self.stream_tasks.lock().await;
                 for (stream_id, handle) in tasks.drain() {
@@ -215,11 +212,11 @@ impl AnyTlsSession {
                 }
             }
 
-            // Clear all streams (drops senders, signals EOF to any remaining receivers)
-            let mut streams = self.streams.write().await;
-            streams.clear();
+            {
+                let mut streams = self.streams.write().await;
+                streams.clear();
+            }
 
-            // Try to shutdown writer gracefully
             if let Ok(mut writer) = self.writer.try_lock() {
                 let _ = writer.shutdown().await;
             }
@@ -231,6 +228,23 @@ impl AnyTlsSession {
         self.peer_version.load(Ordering::Relaxed)
     }
 
+    /// Abort one local stream without closing the whole session.
+    /// Used when a single stream blocks recv_loop for too long.
+    async fn abort_local_stream(&self, stream_id: u32) {
+        {
+            let mut streams = self.streams.write().await;
+            streams.remove(&stream_id);
+        }
+
+        {
+            let mut tasks = self.stream_tasks.lock().await;
+            if let Some(handle) = tasks.remove(&stream_id) {
+                log::trace!("Aborting lagging stream task {}", stream_id);
+                handle.abort();
+            }
+        }
+    }
+
     /// Run the session (blocking)
     ///
     /// This starts the receive loop and processes frames until the connection closes.
@@ -238,13 +252,11 @@ impl AnyTlsSession {
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
         let session = Arc::clone(self);
 
-        // Start the outgoing data processor
         let session_clone = Arc::clone(&session);
         let outgoing_task = tokio::spawn(async move {
             session_clone.process_outgoing().await;
         });
 
-        // Run the receive loop
         let result = session.recv_loop().await;
 
         match &result {
@@ -256,7 +268,6 @@ impl AnyTlsSession {
             }
         }
 
-        // Cleanup
         session.close().await;
         outgoing_task.abort();
 
@@ -272,9 +283,7 @@ impl AnyTlsSession {
                 break;
             }
 
-            // Check if this is a FIN signal (empty data)
             if data.is_empty() {
-                // Send FIN frame
                 let frame = Frame::control(Command::Fin, stream_id);
                 if let Err(e) = self.write_frame(&frame).await {
                     log::warn!(
@@ -286,11 +295,9 @@ impl AnyTlsSession {
                     break;
                 }
 
-                // Remove stream from map
                 let mut streams = self.streams.write().await;
                 streams.remove(&stream_id);
             } else {
-                // Send data frame
                 let frame = Frame::data(stream_id, data);
                 if let Err(e) = self.write_frame(&frame).await {
                     log::warn!(
@@ -309,7 +316,6 @@ impl AnyTlsSession {
     async fn recv_loop(self: &Arc<Self>) -> io::Result<()> {
         let mut buffer = BytesMut::with_capacity(8192);
 
-        // Prepend any initial data that was buffered during auth
         if let Some(initial) = self.initial_data.lock().unwrap().take() {
             buffer.extend_from_slice(&initial);
         }
@@ -319,7 +325,6 @@ impl AnyTlsSession {
                 return Ok(());
             }
 
-            // Decode and process any frames already in buffer (from initial data)
             while let Some(frame) = FrameCodec::decode(&mut buffer)? {
                 if let Err(e) = self.handle_frame(frame).await {
                     log::warn!("Error handling frame: {}", e);
@@ -327,11 +332,10 @@ impl AnyTlsSession {
                 }
             }
 
-            // Read more data from connection
             let n = {
                 let mut reader = self.reader.lock().await;
                 match reader.read_buf(&mut buffer).await {
-                    Ok(0) => return Ok(()), // Connection closed
+                    Ok(0) => return Ok(()),
                     Ok(n) => n,
                     Err(e) => return Err(e),
                 }
@@ -345,39 +349,49 @@ impl AnyTlsSession {
     async fn handle_frame(self: &Arc<Self>, frame: Frame) -> io::Result<()> {
         match frame.cmd {
             Command::Psh => {
-                // Skip zero-length PSH frames (matches reference implementation)
                 if frame.data.is_empty() {
                     log::trace!("Ignoring zero-length PSH for stream {}", frame.stream_id);
                     return Ok(());
                 }
 
-                // Data frame - forward to stream
-                // Clone sender and release lock before async send to avoid deadlock
+                let stream_id = frame.stream_id;
                 let tx = {
                     let streams = self.streams.read().await;
-                    streams.get(&frame.stream_id).cloned()
+                    streams.get(&stream_id).cloned()
                 };
+
                 if let Some(tx) = tx {
-                    // Async send provides backpressure - blocks if stream channel is full
-                    // This matches Go's channel behavior (head-of-line blocking)
-                    if tx.send(frame.data).await.is_err() {
-                        log::trace!("Stream {} channel closed", frame.stream_id);
+                    match tokio::time::timeout(
+                        STREAM_CHANNEL_SEND_TIMEOUT,
+                        tx.send(frame.data),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            log::trace!("Stream {} channel closed", stream_id);
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Stream {} channel blocked for {:?}, aborting local stream to protect session",
+                                stream_id,
+                                STREAM_CHANNEL_SEND_TIMEOUT
+                            );
+                            self.abort_local_stream(stream_id).await;
+                        }
                     }
                 } else {
-                    log::trace!("Data for unknown stream {}", frame.stream_id);
+                    log::trace!("Data for unknown stream {}", stream_id);
                 }
             }
 
             Command::Syn => {
-                // Stream open request (server side)
                 if self.is_client {
                     log::warn!("Received SYN on client side");
                     return Ok(());
                 }
 
-                // Check if we've received client settings
                 if !self.received_client_settings.load(Ordering::Relaxed) {
-                    // Send alert - client must send settings first
                     let alert_frame = Frame::with_data(
                         Command::Alert,
                         0,
@@ -392,8 +406,6 @@ impl AnyTlsSession {
 
                 let stream_id = frame.stream_id;
 
-                // Check if stream already exists and register atomically
-                // This prevents race conditions with duplicate SYNs
                 let stream_opt = {
                     let mut streams = self.streams.write().await;
                     use std::collections::hash_map::Entry;
@@ -403,7 +415,6 @@ impl AnyTlsSession {
                             None
                         }
                         Entry::Vacant(entry) => {
-                            // Create new stream with bounded channel for backpressure
                             let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
                             let stream = AnyTlsStream::new(
                                 stream_id,
@@ -417,43 +428,40 @@ impl AnyTlsSession {
                     }
                 };
 
-                // Handle the new stream internally with timeout and task tracking
                 if let Some(stream) = stream_opt {
                     let session = Arc::clone(self);
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
                     let handle = tokio::spawn(async move {
-                        // No global lifetime timeout here:
-                        // only stream setup phases are timeout-limited inside handle_new_stream().
                         match session.handle_new_stream(stream).await {
                             Ok(()) => {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
                             Err(e) => {
-                                log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
+                                log::debug!(
+                                    "AnyTLS stream {} error: {}",
+                                    stream_id_for_cleanup,
+                                    e
+                                );
                             }
                         }
 
-                        // Remove self from stream_tasks on completion
                         let mut tasks = session_for_cleanup.stream_tasks.lock().await;
                         tasks.remove(&stream_id_for_cleanup);
                     });
 
-                    // Track the task for cancellation on session close
                     let mut tasks = self.stream_tasks.lock().await;
                     tasks.insert(stream_id, handle);
                 }
             }
 
             Command::SynAck => {
-                // Server acknowledges stream (client side)
                 if !self.is_client {
                     log::warn!("Received SYNACK on server side");
                     return Ok(());
                 }
 
-                // Handle SYNACK - for now just log
                 if !frame.data.is_empty() {
                     let error_msg = String::from_utf8_lossy(&frame.data);
                     log::warn!(
@@ -467,28 +475,37 @@ impl AnyTlsSession {
             }
 
             Command::Fin => {
-                // Stream close - remove from map first, then signal EOF
-                // This matches reference implementation and prevents races where
-                // new data arrives for a closing stream
+                let stream_id = frame.stream_id;
+
                 let stream_tx = {
                     let mut streams = self.streams.write().await;
-                    streams.remove(&frame.stream_id)
+                    streams.remove(&stream_id)
                 };
 
-                // Signal EOF to stream (empty bytes)
-                // Use async send for consistency, though FIN is typically not backpressured
                 if let Some(tx) = stream_tx {
-                    let _ = tx.send(Bytes::new()).await;
+                    match tx.try_send(Bytes::new()) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::trace!(
+                                "Stream {} EOF not delivered immediately because channel is full; aborting task",
+                                stream_id
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
+
+                let mut tasks = self.stream_tasks.lock().await;
+                if let Some(handle) = tasks.remove(&stream_id) {
+                    handle.abort();
                 }
             }
 
             Command::Waste => {
-                // Padding - just discard
                 log::trace!("Received {} bytes of padding", frame.data.len());
             }
 
             Command::Settings => {
-                // Client settings (server side)
                 if self.is_client {
                     return Ok(());
                 }
@@ -497,12 +514,10 @@ impl AnyTlsSession {
 
                 let settings = StringMap::from_bytes(&frame.data);
 
-                // Check padding-md5
                 if settings
                     .get("padding-md5")
                     .is_some_and(|client_md5| client_md5 != self.padding.md5())
                 {
-                    // Send updated padding scheme
                     let update_frame = Frame::with_data(
                         Command::UpdatePaddingScheme,
                         0,
@@ -511,7 +526,6 @@ impl AnyTlsSession {
                     self.write_control_frame(&update_frame).await?;
                 }
 
-                // Check client version
                 if let Some(v) = settings
                     .get("v")
                     .and_then(|s| s.parse::<u8>().ok())
@@ -519,7 +533,6 @@ impl AnyTlsSession {
                 {
                     self.peer_version.store(v, Ordering::Relaxed);
 
-                    // Send server settings
                     let mut server_settings = StringMap::new();
                     server_settings.insert("v", "2");
                     let settings_frame = Frame::with_data(
@@ -532,7 +545,6 @@ impl AnyTlsSession {
             }
 
             Command::ServerSettings => {
-                // Server settings (client side)
                 if !self.is_client {
                     return Ok(());
                 }
@@ -544,29 +556,24 @@ impl AnyTlsSession {
             }
 
             Command::UpdatePaddingScheme => {
-                // Server updates padding scheme (client side)
                 if !self.is_client {
                     return Ok(());
                 }
                 log::info!("Received padding scheme update from server");
-                // Note: In a full implementation, we'd update the padding factory here
             }
 
             Command::Alert => {
-                // Alert - fatal error
                 let msg = String::from_utf8_lossy(&frame.data);
                 log::error!("Received alert: {}", msg);
                 return Err(io::Error::other(msg.to_string()));
             }
 
             Command::HeartRequest => {
-                // Send heart response
                 let response = Frame::control(Command::HeartResponse, frame.stream_id);
                 self.write_control_frame(&response).await?;
             }
 
             Command::HeartResponse => {
-                // Heartbeat response - just acknowledge
                 log::trace!("Received heartbeat response");
             }
         }
@@ -576,23 +583,19 @@ impl AnyTlsSession {
 
     /// Write a frame to the connection with padding applied
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
-        // Use reusable write buffer to avoid allocation
         let mut write_buf = self.write_buf.lock().await;
         write_buf.clear();
         frame.encode_into(&mut write_buf);
 
-        // Handle buffering
         if self.buffering.load(Ordering::Relaxed) {
             let mut buffer = self.buffer.lock().await;
             buffer.extend_from_slice(&write_buf);
             return Ok(());
         }
 
-        // Flush any buffered data
         {
             let mut buffer = self.buffer.lock().await;
             if !buffer.is_empty() {
-                // Prepend buffered data
                 let mut combined = BytesMut::from(&buffer[..]);
                 combined.extend_from_slice(&write_buf);
                 write_buf.clear();
@@ -601,14 +604,10 @@ impl AnyTlsSession {
             }
         }
 
-        // Apply padding if enabled
         if self.send_padding.load(Ordering::Relaxed) {
-            // Use fetch_add + 1 to match Go's Add() semantics (returns new value)
-            // This ensures packets 1-7 get padded (not 0-7), matching reference implementations
             let pkt = self.pkt_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
             if pkt < self.padding.stop() {
-                // Need to take ownership for padding function
                 let data = write_buf.split();
                 return self.write_with_padding(data, pkt).await;
             } else {
@@ -616,7 +615,6 @@ impl AnyTlsSession {
             }
         }
 
-        // Write directly
         let mut writer = self.writer.lock().await;
         writer.write_all(&write_buf).await?;
         writer.flush().await
@@ -638,7 +636,6 @@ impl AnyTlsSession {
             let remain_payload_len = data.len();
 
             if size == CHECK_MARK {
-                // Check mark: stop if no more data
                 if remain_payload_len == 0 {
                     break;
                 }
@@ -648,38 +645,32 @@ impl AnyTlsSession {
             let size = size as usize;
 
             if remain_payload_len > size {
-                // This packet is all payload - send exactly `size` bytes
                 writer.write_all(&data[..size]).await?;
                 data = data.split_off(size);
             } else if remain_payload_len > 0 {
-                // This packet contains payload + padding
                 let padding_len = size.saturating_sub(remain_payload_len + FRAME_HEADER_SIZE);
 
                 if padding_len > 0 {
-                    // Append padding frame directly to data buffer (no intermediate allocation)
                     data.reserve(FRAME_HEADER_SIZE + padding_len);
                     data.put_u8(Command::Waste as u8);
-                    data.put_u32(0); // stream_id = 0
+                    data.put_u32(0);
                     data.put_u16(padding_len as u16);
-                    data.put_bytes(0, padding_len); // Zero-fill without allocation
+                    data.put_bytes(0, padding_len);
                 }
 
                 writer.write_all(&data).await?;
                 data.clear();
             } else {
-                // This packet is all padding - write directly without intermediate buffer
-                // Use a small stack buffer for the header
                 let header = [
                     Command::Waste as u8,
                     0,
                     0,
                     0,
-                    0, // stream_id = 0
+                    0,
                     (size >> 8) as u8,
                     size as u8,
                 ];
                 writer.write_all(&header).await?;
-                // Write zeros for padding body - use a static buffer for small sizes
                 const ZERO_BUF: [u8; 1024] = [0u8; 1024];
                 let mut remaining = size;
                 while remaining > 0 {
@@ -690,7 +681,6 @@ impl AnyTlsSession {
             }
         }
 
-        // Write any remaining payload
         if !data.is_empty() {
             writer.write_all(&data).await?;
         }
@@ -714,9 +704,6 @@ impl AnyTlsSession {
     }
 
     /// Write a control frame with timeout
-    ///
-    /// Control frames (Settings, Alert, SYNACK, etc.) should complete quickly.
-    /// If they timeout, the connection is likely dead and should be closed.
     async fn write_control_frame(&self, frame: &Frame) -> io::Result<()> {
         match tokio::time::timeout(CONTROL_FRAME_TIMEOUT, self.write_frame(frame)).await {
             Ok(result) => result,
@@ -740,7 +727,6 @@ impl AnyTlsSession {
 
         log::trace!("AnyTLS stream {} setup started", stream_id);
 
-        // Read destination address (SOCKS5 address format)
         let destination = match tokio::time::timeout(
             STREAM_INIT_TIMEOUT,
             read_location_direct(&mut stream),
@@ -765,7 +751,6 @@ impl AnyTlsSession {
             destination
         );
 
-        // Check for UoT magic addresses
         if let Address::Hostname(host) = destination.address() {
             if host == UOT_V2_MAGIC_ADDRESS {
                 return self.handle_uot_v2(stream).await;
@@ -774,7 +759,6 @@ impl AnyTlsSession {
             }
         }
 
-        // Regular TCP forwarding with proper routing
         self.handle_tcp_forward(stream, destination).await
     }
 
@@ -795,7 +779,8 @@ impl AnyTlsSession {
             Ok(Ok(action)) => action,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let error_msg = format!("route decision timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                let error_msg =
+                    format!("route decision timed out after {:?}", STREAM_CONNECT_TIMEOUT);
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                 return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
             }
@@ -812,7 +797,6 @@ impl AnyTlsSession {
                     remote_location
                 );
 
-                // Connect through the proxy chain
                 let client_result = match tokio::time::timeout(
                     STREAM_CONNECT_TIMEOUT,
                     chain_group.connect_tcp(remote_location, &self.resolver),
@@ -821,28 +805,25 @@ impl AnyTlsSession {
                 {
                     Ok(Ok(result)) => result,
                     Ok(Err(e)) => {
-                        // Send SYNACK with error message (protocol v2)
                         let error_msg = format!("connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
                     }
                     Err(_) => {
-                        let error_msg = format!("connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
+                        let error_msg =
+                            format!("connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
                     }
                 };
                 let mut client_stream = client_result.client_stream;
 
-                // Send successful SYNACK (protocol v2)
                 if let Err(e) = self.send_synack(stream_id, None).await {
                     log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
-                    // Continue anyway - client may be v1
                 }
 
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
-                // Bidirectional copy
                 let result =
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
@@ -858,7 +839,6 @@ impl AnyTlsSession {
                 result
             }
             ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
                 let error_msg = format!("blocked by rules: {}", destination);
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
 
@@ -888,7 +868,6 @@ impl AnyTlsSession {
             ));
         }
 
-        // Read UoT V2 request header: isConnect(u8) + destination(SOCKS5 format)
         let is_connect = match tokio::time::timeout(STREAM_INIT_TIMEOUT, stream.read_u8()).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
@@ -901,7 +880,12 @@ impl AnyTlsSession {
             }
         };
 
-        let destination = match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await {
+        let destination = match tokio::time::timeout(
+            STREAM_INIT_TIMEOUT,
+            read_location_direct(&mut stream),
+        )
+        .await
+        {
             Ok(Ok(dest)) => dest,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -921,12 +905,16 @@ impl AnyTlsSession {
             destination
         );
 
-        if is_connect == 1 {
-            // V2 Connect Mode: Single destination, length-prefixed packets
-            self.handle_uot_v2_connect(stream, destination).await
-        } else {
-            // V2 Non-Connect: Same as V1 (multi-destination)
-            self.handle_uot_multi_destination(stream).await
+        match is_connect {
+            1 => self.handle_uot_v2_connect(stream, destination).await,
+            0 => self.handle_uot_multi_destination(stream).await,
+            _ => {
+                let _ = stream.shutdown().await;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UoT V2 connect flag: {}", is_connect),
+                ))
+            }
         }
     }
 
@@ -956,8 +944,6 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT V2 Connect Mode (single destination)
-    ///
-    /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
         mut stream: AnyTlsStream,
@@ -965,7 +951,6 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        // Use ClientProxySelector for routing
         let action = match tokio::time::timeout(
             STREAM_CONNECT_TIMEOUT,
             self.proxy_provider.judge(destination.clone().into(), &self.resolver),
@@ -1001,11 +986,9 @@ impl AnyTlsSession {
                     remote_location
                 );
 
-                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
                 let server_stream: Box<dyn AsyncMessageStream> =
                     Box::new(VlessMessageStream::new(stream));
 
-                // Connect through the proxy chain
                 let client_stream = match tokio::time::timeout(
                     STREAM_CONNECT_TIMEOUT,
                     chain_group.connect_udp_bidirectional(&self.resolver, remote_location),
@@ -1014,27 +997,22 @@ impl AnyTlsSession {
                 {
                     Ok(Ok(result)) => result,
                     Ok(Err(e)) => {
-                        // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
                     }
                     Err(_) => {
-                        let error_msg = format!(
-                            "UDP connect timed out after {:?}",
-                            STREAM_CONNECT_TIMEOUT
-                        );
+                        let error_msg =
+                            format!("UDP connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
                     }
                 };
 
-                // Send successful SYNACK (protocol v2)
                 let _ = self.send_synack(stream_id, None).await;
 
                 log::debug!("AnyTLS stream {} UoT V2 connect: connected", stream_id);
 
-                // Run UDP copy
                 let result = run_udp_copy(server_stream, client_stream, false, false).await;
 
                 if let Err(e) = &result {
@@ -1046,7 +1024,6 @@ impl AnyTlsSession {
                 result
             }
             ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
@@ -1066,8 +1043,6 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)
-    ///
-    /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_multi_destination(&self, stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
@@ -1076,19 +1051,16 @@ impl AnyTlsSession {
             stream_id
         );
 
-        // Wrap AnyTlsStream as AsyncTargetedMessageStream (UotV1ServerStream)
         let server_stream: Box<dyn AsyncTargetedMessageStream> =
             Box::new(UotV1ServerStream::new(stream));
 
-        // Send successful SYNACK (protocol v2)
         let _ = self.send_synack(stream_id, None).await;
 
-        // Run per-destination routing
         let result = run_udp_routing(
             ServerStream::Targeted(server_stream),
             self.proxy_provider.clone(),
             self.resolver.clone(),
-            false, // no initial flush needed
+            false,
         )
         .await;
 
