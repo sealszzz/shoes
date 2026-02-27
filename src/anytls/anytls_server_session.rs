@@ -230,6 +230,11 @@ impl AnyTlsSession {
 
     /// Abort one local stream without closing the whole session.
     /// Used when a single stream blocks recv_loop for too long.
+    ///
+    /// Note:
+    /// - This is a purely local protective action.
+    /// - It does NOT proactively send FIN to peer.
+    /// - Session stays alive; subsequent frames for this stream_id are ignored.
     async fn abort_local_stream(&self, stream_id: u32) {
         {
             let mut streams = self.streams.write().await;
@@ -477,11 +482,14 @@ impl AnyTlsSession {
             Command::Fin => {
                 let stream_id = frame.stream_id;
 
+                // Remove from map first; after this, new PSH for same stream_id is ignored.
                 let stream_tx = {
                     let mut streams = self.streams.write().await;
                     streams.remove(&stream_id)
                 };
 
+                // Best-effort EOF delivery only; do NOT block recv_loop here.
+                // If EOF cannot be delivered immediately, just abort local task.
                 if let Some(tx) = stream_tx {
                     match tx.try_send(Bytes::new()) {
                         Ok(()) => {}
@@ -495,6 +503,8 @@ impl AnyTlsSession {
                     }
                 }
 
+                // Session-normal FIN semantics:
+                // close local stream only, and do NOT send FIN back.
                 let mut tasks = self.stream_tasks.lock().await;
                 if let Some(handle) = tasks.remove(&stream_id) {
                     handle.abort();
