@@ -8,17 +8,13 @@
 //!    - `0x01`: IPv4
 //!    - `0x03`: Domain
 //!    - `0x04`: IPv6
-//!    - Used by:
-//!      - h2mux packet_addr mode
-//!      - UoT V2 request headers
+//!    - Used by: h2mux packet_addr mode, UoT V2 request headers
 //!
 //! 2. **AddrParser format**
 //!    - `0x00`: IPv4
 //!    - `0x01`: IPv6
 //!    - `0x02`: Domain
-//!    - Used by:
-//!      - UoT V1 packet payloads
-//!      - UoT V2 non-connect packet payloads
+//!    - Used by: UoT V1 packet payloads, UoT V2 non-connect packet payloads
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -26,15 +22,19 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::address::{Address, NetLocation};
 
 /// SOCKS5 ATYP values.
+#[allow(dead_code)]
 pub const ATYP_IPV4: u8 = 0x01;
+#[allow(dead_code)]
 pub const ATYP_DOMAIN: u8 = 0x03;
+#[allow(dead_code)]
 pub const ATYP_IPV6: u8 = 0x04;
 
-/// AddrParser ATYP values.
+/// AddrParser ATYP values (sing-box strict standard).
 pub const ADDRPARSER_ATYP_IPV4: u8 = 0x00;
 pub const ADDRPARSER_ATYP_IPV6: u8 = 0x01;
 pub const ADDRPARSER_ATYP_DOMAIN: u8 = 0x02;
 
+#[allow(dead_code)]
 #[inline]
 pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
@@ -77,10 +77,11 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
                 total_len,
             )))
         }
-        _ => Err(io::Error::other(format!("unknown UoT ATYP: {atyp}"))),
+        _ => Err(io::Error::other(format!("unknown SOCKS5 ATYP: {atyp}"))),
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     match addr {
