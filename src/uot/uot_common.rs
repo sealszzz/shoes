@@ -35,12 +35,6 @@ pub const ADDRPARSER_ATYP_IPV4: u8 = 0x00;
 pub const ADDRPARSER_ATYP_IPV6: u8 = 0x01;
 pub const ADDRPARSER_ATYP_DOMAIN: u8 = 0x02;
 
-/// Parse a SOCKS5-format address: `ATYP + address + port`.
-///
-/// Returns:
-/// - `Ok(Some((location, bytes_consumed)))` if a full address is available
-/// - `Ok(None)` if more bytes are needed
-/// - `Err(_)` if the data is malformed
 #[inline]
 pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
@@ -87,9 +81,6 @@ pub fn parse_uot_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>
     }
 }
 
-/// Write a SOCKS5-format address: `ATYP + address + port`.
-///
-/// Returns the number of bytes written.
 #[inline]
 pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     match addr {
@@ -108,12 +99,6 @@ pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     }
 }
 
-/// Parse an AddrParser-format address: `ATYP + address + port`.
-///
-/// Returns:
-/// - `Ok(Some((location, bytes_consumed)))` if a full address is available
-/// - `Ok(None)` if more bytes are needed
-/// - `Err(_)` if the data is malformed
 #[inline]
 pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
@@ -162,9 +147,6 @@ pub fn parse_uot_addrparser_address(data: &[u8]) -> io::Result<Option<(NetLocati
     }
 }
 
-/// Write an AddrParser-format address: `ATYP + address + port`.
-///
-/// Returns the number of bytes written.
 #[inline]
 pub fn write_uot_addrparser_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     match addr {
