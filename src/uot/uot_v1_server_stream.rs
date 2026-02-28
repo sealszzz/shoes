@@ -1,10 +1,4 @@
 //! UDP-over-TCP V1 server stream implementation
-//!
-//! V1 Packet format (each packet has full address):
-//! ```text
-//! | ATYP | address  | port  | length | data     |
-//! | u8   | variable | u16be | u16be  | variable |
-//! ```
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,7 +7,7 @@ use std::task::{Context, Poll};
 use futures::ready;
 use tokio::io::ReadBuf;
 
-use super::uot_common::{parse_uot_address, write_uot_address};
+use super::uot_common::{parse_uot_addrparser_address, write_uot_addrparser_address};
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
@@ -56,7 +50,7 @@ impl<S: AsyncStream> UotV1ServerStream<S> {
     fn try_parse_packet(&self) -> std::io::Result<Option<(NetLocation, usize, usize)>> {
         let data = self.read_buf.as_slice();
 
-        let (location, addr_len) = match parse_uot_address(data)? {
+        let (location, addr_len) = match parse_uot_addrparser_address(data)? {
             Some(result) => result,
             None => return Ok(None),
         };
@@ -167,7 +161,7 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
             ))));
         }
 
-        let offset = write_uot_address(&mut this.write_buf, source);
+        let offset = write_uot_addrparser_address(&mut this.write_buf, source);
 
         let len_bytes = (buf.len() as u16).to_be_bytes();
         this.write_buf[offset..offset + 2].copy_from_slice(&len_bytes);
