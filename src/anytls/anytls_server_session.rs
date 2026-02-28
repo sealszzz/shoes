@@ -37,10 +37,6 @@ const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Does NOT apply to the long-lived relay/copy phase.
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Max time we're willing to let one stream backpressure stall recv_loop.
-/// If exceeded, we close that local stream to protect the whole session.
-const STREAM_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -97,14 +93,11 @@ pub struct AnyTlsSession {
     user_name: String,
 
     /// Initial data buffered during auth (to be prepended to first read)
-    /// Uses std::sync::Mutex since it's only accessed once with no await points
     initial_data: std::sync::Mutex<Option<Box<[u8]>>>,
 }
 
 impl AnyTlsSession {
     /// Create a new server session with optional initial data that was buffered during auth.
-    ///
-    /// If `initial_data` is provided, it will be prepended to the first read in recv_loop.
     pub fn new_server_with_initial_data<IO>(
         conn: IO,
         padding: Arc<PaddingFactory>,
@@ -118,8 +111,6 @@ impl AnyTlsSession {
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (reader, writer) = tokio::io::split(conn);
-        // Use bounded channel for outgoing data to provide backpressure
-        // Buffer size is per-session, shared across all streams
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
 
         Arc::new(Self {
@@ -132,7 +123,7 @@ impl AnyTlsSession {
             is_closed: Arc::new(AtomicBool::new(false)),
             padding,
             is_client: false,
-            send_padding: AtomicBool::new(false), // Server doesn't pad by default
+            send_padding: AtomicBool::new(false),
             pkt_counter: AtomicU32::new(0),
             buffering: AtomicBool::new(false),
             buffer: Mutex::new(Vec::new()),
@@ -147,10 +138,6 @@ impl AnyTlsSession {
         })
     }
 
-    /// Create a minimal server session for testing protocol framing.
-    ///
-    /// Uses stub resolver/proxy_provider that panic if stream forwarding is attempted.
-    /// Use this only for testing protocol framing, not end-to-end stream handling.
     #[cfg(test)]
     pub fn new_server_test<IO>(conn: IO, padding: Arc<PaddingFactory>) -> Arc<Self>
     where
@@ -192,7 +179,6 @@ impl AnyTlsSession {
         })
     }
 
-    /// Check if the session is closed
     pub fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::Relaxed)
     }
@@ -219,7 +205,6 @@ impl AnyTlsSession {
             || err.kind() == io::ErrorKind::ConnectionAborted
     }
 
-    /// Close the session
     pub async fn close(&self) {
         if self
             .is_closed
@@ -245,37 +230,10 @@ impl AnyTlsSession {
         }
     }
 
-    /// Get the peer protocol version
     pub fn peer_version(&self) -> u8 {
         self.peer_version.load(Ordering::Relaxed)
     }
 
-    /// Abort one local stream without closing the whole session.
-    /// Used when a single stream blocks recv_loop for too long.
-    ///
-    /// Note:
-    /// - This is a purely local protective action.
-    /// - It does NOT proactively send FIN to peer.
-    /// - Session stays alive; subsequent frames for this stream_id are ignored.
-    async fn abort_local_stream(&self, stream_id: u32) {
-        {
-            let mut streams = self.streams.write().await;
-            streams.remove(&stream_id);
-        }
-
-        {
-            let mut tasks = self.stream_tasks.lock().await;
-            if let Some(handle) = tasks.remove(&stream_id) {
-                log::trace!("Aborting lagging stream task {}", stream_id);
-                handle.abort();
-            }
-        }
-    }
-
-    /// Run the session (blocking)
-    ///
-    /// This starts the receive loop and processes frames until the connection closes.
-    /// New streams are handled internally using the configured resolver and proxy_provider.
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
         let session = Arc::clone(self);
 
@@ -305,7 +263,6 @@ impl AnyTlsSession {
         result
     }
 
-    /// Process outgoing data from streams
     async fn process_outgoing(&self) {
         let mut rx = self.outgoing_rx.lock().await;
 
@@ -343,7 +300,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Main receive loop - reads frames and dispatches them
     async fn recv_loop(self: &Arc<Self>) -> io::Result<()> {
         let mut buffer = BytesMut::with_capacity(8192);
 
@@ -380,7 +336,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle a received frame
     async fn handle_frame(self: &Arc<Self>, frame: Frame) -> io::Result<()> {
         match frame.cmd {
             Command::Psh => {
@@ -396,20 +351,12 @@ impl AnyTlsSession {
                 };
 
                 if let Some(tx) = tx {
-                    match tokio::time::timeout(STREAM_CHANNEL_SEND_TIMEOUT, tx.send(frame.data)).await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            log::trace!("Stream {} channel closed", stream_id);
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "Stream {} channel blocked for {:?}, aborting local stream to protect session",
-                                stream_id,
-                                STREAM_CHANNEL_SEND_TIMEOUT
-                            );
-                            self.abort_local_stream(stream_id).await;
-                        }
+                    // FIX 1: Removed the 3-second forced timeout self-destruct logic.
+                    // Allowing `.await` here naturally transfers backpressure to the underlying
+                    // TCP connection's sliding window. This ensures that a slow-consuming stream
+                    // will throttle the sender gracefully instead of violently killing the connection.
+                    if tx.send(frame.data).await.is_err() {
+                        log::trace!("Stream {} channel closed natively", stream_id);
                     }
                 } else {
                     log::trace!("Data for unknown stream {}", stream_id);
@@ -471,21 +418,14 @@ impl AnyTlsSession {
                             }
                             Err(e) => {
                                 if AnyTlsSession::is_benign_stream_error(&e) {
-                                    log::trace!(
-                                        "AnyTLS stream {} ended: {}",
-                                        stream_id_for_cleanup,
-                                        e
-                                    );
+                                    log::trace!("AnyTLS stream {} ended: {}", stream_id_for_cleanup, e);
                                 } else {
-                                    log::debug!(
-                                        "AnyTLS stream {} error: {}",
-                                        stream_id_for_cleanup,
-                                        e
-                                    );
+                                    log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
                                 }
                             }
                         }
 
+                        // Stream self-cleanup mechanism
                         let mut tasks = session_for_cleanup.stream_tasks.lock().await;
                         tasks.remove(&stream_id_for_cleanup);
                     });
@@ -512,32 +452,17 @@ impl AnyTlsSession {
             Command::Fin => {
                 let stream_id = frame.stream_id;
 
-                // Remove from map first; after this, new PSH for same stream_id is ignored.
                 let stream_tx = {
                     let mut streams = self.streams.write().await;
                     streams.remove(&stream_id)
                 };
 
-                // Best-effort EOF delivery only; do NOT block recv_loop here.
-                // If EOF cannot be delivered immediately, just abort local task.
+                // FIX 2: Removed `handle.abort()`.
+                // Smoothly sending EOF (Bytes::new) through the channel allows the underlying copy 
+                // tasks to consume the remaining buffered data before exiting naturally. This prevents 
+                // the tail end of web pages or files from being truncated due to abrupt task termination.
                 if let Some(tx) = stream_tx {
-                    match tx.try_send(Bytes::new()) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            log::trace!(
-                                "Stream {} EOF not delivered immediately because channel is full; aborting task",
-                                stream_id
-                            );
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                    }
-                }
-
-                // Session-normal FIN semantics:
-                // close local stream only, and do NOT send FIN back.
-                let mut tasks = self.stream_tasks.lock().await;
-                if let Some(handle) = tasks.remove(&stream_id) {
-                    handle.abort();
+                    let _ = tx.send(Bytes::new()).await;
                 }
             }
 
@@ -609,8 +534,17 @@ impl AnyTlsSession {
             }
 
             Command::HeartRequest => {
-                let response = Frame::control(Command::HeartResponse, frame.stream_id);
-                self.write_control_frame(&response).await?;
+                // FIX 3: Respond to heartbeats asynchronously to prevent deadlocks!
+                // Placing the response in a separate task ensures that the network layer 
+                // can continue to receive packets without delay even when `recv_loop` is under high load.
+                let session = Arc::clone(self);
+                let stream_id = frame.stream_id;
+                tokio::spawn(async move {
+                    let response = Frame::control(Command::HeartResponse, stream_id);
+                    if let Err(e) = session.write_control_frame(&response).await {
+                        log::debug!("Failed to send HeartResponse: {}", e);
+                    }
+                });
             }
 
             Command::HeartResponse => {
@@ -621,46 +555,51 @@ impl AnyTlsSession {
         Ok(())
     }
 
-    /// Write a frame to the connection with padding applied
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
-        let mut write_buf = self.write_buf.lock().await;
-        write_buf.clear();
-        frame.encode_into(&mut write_buf);
+        // FIX 4: Refined lock granularity to prevent lock contention.
+        // The scope of the `write_buf` lock is now strictly limited to buffer encoding. 
+        // Once the bytes are extracted via `split()`, the lock is released immediately 
+        // before blocking on the actual underlying IO write operations.
+        let write_data = {
+            let mut write_buf = self.write_buf.lock().await;
+            write_buf.clear();
+            frame.encode_into(&mut write_buf);
+            write_buf.split() // Quickly extract the data block and release the lock
+        };
 
         if self.buffering.load(Ordering::Relaxed) {
             let mut buffer = self.buffer.lock().await;
-            buffer.extend_from_slice(&write_buf);
+            buffer.extend_from_slice(&write_data);
             return Ok(());
         }
 
-        {
+        let combined_data = {
             let mut buffer = self.buffer.lock().await;
             if !buffer.is_empty() {
                 let mut combined = BytesMut::from(&buffer[..]);
-                combined.extend_from_slice(&write_buf);
-                write_buf.clear();
-                write_buf.extend_from_slice(&combined);
+                combined.extend_from_slice(&write_data);
                 buffer.clear();
+                combined
+            } else {
+                write_data
             }
-        }
+        };
 
         if self.send_padding.load(Ordering::Relaxed) {
             let pkt = self.pkt_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
             if pkt < self.padding.stop() {
-                let data = write_buf.split();
-                return self.write_with_padding(data, pkt).await;
+                return self.write_with_padding(combined_data, pkt).await;
             } else {
                 self.send_padding.store(false, Ordering::Relaxed);
             }
         }
 
         let mut writer = self.writer.lock().await;
-        writer.write_all(&write_buf).await?;
+        writer.write_all(&combined_data).await?;
         writer.flush().await
     }
 
-    /// Write data with padding applied according to scheme
     async fn write_with_padding(&self, mut data: BytesMut, pkt: u32) -> io::Result<()> {
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
 
@@ -728,7 +667,6 @@ impl AnyTlsSession {
         writer.flush().await
     }
 
-    /// Send SYNACK for a stream (server side, protocol v2)
     pub async fn send_synack(&self, stream_id: u32, error: Option<&str>) -> io::Result<()> {
         if self.peer_version() < 2 {
             return Ok(());
@@ -743,7 +681,6 @@ impl AnyTlsSession {
         self.write_control_frame(&frame).await
     }
 
-    /// Write a control frame with timeout
     async fn write_control_frame(&self, frame: &Frame) -> io::Result<()> {
         match tokio::time::timeout(CONTROL_FRAME_TIMEOUT, self.write_frame(frame)).await {
             Ok(result) => result,
@@ -761,7 +698,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle a new stream by reading destination and routing appropriately
     async fn handle_new_stream(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
@@ -799,7 +735,6 @@ impl AnyTlsSession {
         self.handle_tcp_forward(stream, destination).await
     }
 
-    /// Handle regular TCP forwarding with ClientProxySelector routing
     async fn handle_tcp_forward(
         &self,
         mut stream: AnyTlsStream,
@@ -893,7 +828,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle UoT V2 stream (sp.v2.udp-over-tcp.arpa)
     async fn handle_uot_v2(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
         log::trace!("AnyTLS stream {} UoT V2 setup started", stream_id);
@@ -959,7 +893,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle UoT V1 stream (sp.udp-over-tcp.arpa) - multi-destination mode
     async fn handle_uot_v1(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
         log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
@@ -984,7 +917,6 @@ impl AnyTlsSession {
         self.handle_uot_multi_destination(stream).await
     }
 
-    /// Handle UoT V2 Connect Mode (single destination)
     async fn handle_uot_v2_connect(
         &self,
         mut stream: AnyTlsStream,
@@ -1091,7 +1023,6 @@ impl AnyTlsSession {
         }
     }
 
-    /// Handle UoT multi-destination mode (V1 and V2 non-connect)
     async fn handle_uot_multi_destination(&self, stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
