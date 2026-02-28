@@ -5,10 +5,6 @@
 //! | ATYP | address  | port  | length | data     |
 //! | u8   | variable | u16be | u16be  | variable |
 //! ```
-//!
-//! Note:
-//! - UoT V1 packet payloads use sing-box AddrParser address format
-//!   (`0x00/0x01/0x02`), strictly adhering to sing-box standard.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -17,7 +13,7 @@ use std::task::{Context, Poll};
 use futures::ready;
 use tokio::io::ReadBuf;
 
-use super::uot_common::{parse_uot_addrparser_address, write_uot_addrparser_address};
+use super::uot_common::{parse_uot_address, write_uot_address};
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
@@ -26,10 +22,8 @@ use crate::async_stream::{
 use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
 
-// Buffer must be larger than the max UDP payload (65535) + header sizes.
 const BUFFER_SIZE: usize = 65536 + 2048;
 
-/// UoT V1 server stream for multi-destination UDP packets
 pub struct UotV1ServerStream<S> {
     stream: S,
     read_buf: SlideBuffer,
@@ -62,8 +56,7 @@ impl<S: AsyncStream> UotV1ServerStream<S> {
     fn try_parse_packet(&self) -> std::io::Result<Option<(NetLocation, usize, usize)>> {
         let data = self.read_buf.as_slice();
 
-        // STRICT SING-BOX SPEC: Use AddrParser format for UoT V1 payload
-        let (location, addr_len) = match parse_uot_addrparser_address(data)? {
+        let (location, addr_len) = match parse_uot_address(data)? {
             Some(result) => result,
             None => return Ok(None),
         };
@@ -101,11 +94,9 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
                 Some((location, payload_start, payload_len)) => {
                     let data = this.read_buf.as_slice();
                     
-                    // Safely truncate the payload to fit caller's buffer to prevent panics
                     let copy_len = std::cmp::min(payload_len, buf.remaining());
                     buf.put_slice(&data[payload_start..payload_start + copy_len]);
 
-                    // Consume the entire packet from the slide buffer regardless of truncation
                     let total_consumed = payload_start + payload_len;
                     this.read_buf.consume(total_consumed);
 
@@ -150,7 +141,6 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        // Flush pending data before accepting a new packet
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
@@ -177,23 +167,22 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
             ))));
         }
 
-        // STRICT SING-BOX SPEC: Write AddrParser format
-        let offset = write_uot_addrparser_address(&mut this.write_buf, source);
+        let offset = write_uot_address(&mut this.write_buf, source);
+
         let len_bytes = (buf.len() as u16).to_be_bytes();
         this.write_buf[offset..offset + 2].copy_from_slice(&len_bytes);
-        
         let data_start = offset + 2;
-        this.write_buf[data_start..data_start + buf.len()].copy_from_slice(buf);
-        this.write_buf_len = total_len;
 
-        // Immediately flush newly buffered packet to network stream to prevent stalling
+        this.write_buf[data_start..data_start + buf.len()].copy_from_slice(buf);
+        this.write_buf_len = data_start + buf.len();
+
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero))),
                 Poll::Ready(Ok(n)) => this.write_buf_sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => break, // Data is safely buffered; caller can proceed.
+                Poll::Pending => break,
             }
         }
 
@@ -203,7 +192,7 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
 
 impl<S: AsyncStream> AsyncFlushMessage for UotV1ServerStream<S> {
     fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
 
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
@@ -227,8 +216,8 @@ impl<S: AsyncStream> AsyncShutdownMessage for UotV1ServerStream<S> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut this = self.get_mut();
-        ready!(Pin::new(&mut this).poll_flush_message(cx))?;
+        let this = self.get_mut();
+        ready!(Pin::new(&mut *this).poll_flush_message(cx))?;
         Pin::new(&mut this.stream).poll_shutdown(cx)
     }
 }
