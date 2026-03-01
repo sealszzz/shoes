@@ -1,7 +1,4 @@
 //! AnyTLS Session implementation
-//!
-//! A Session manages multiple Streams over a single TLS connection,
-//! handling framing, multiplexing, padding, and stream routing.
 
 use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
@@ -11,7 +8,7 @@ use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
-use crate::routing::{ServerStream, run_udp_routing};
+use crate::routing::{run_udp_routing, ServerStream};
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
@@ -19,85 +16,51 @@ use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-/// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Timeout for reading initial destination / UoT headers on a new stream
-/// Prevents half-open streams from hanging forever before routing starts.
 const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Timeout for route decision + outbound connect during stream setup
-/// Does NOT apply to the long-lived relay/copy phase.
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
-    /// Underlying connection (split into reader/writer)
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
 
-    /// Stream management (bounded channels for backpressure)
     streams: RwLock<HashMap<u32, mpsc::Sender<Bytes>>>,
-
-    /// Active stream handler tasks (for cancellation on session close)
     stream_tasks: Mutex<HashMap<u32, JoinHandle<()>>>,
 
-    /// Channel for receiving outgoing data from streams (bounded for backpressure)
     outgoing_rx: Mutex<mpsc::Receiver<(u32, Bytes)>>,
     outgoing_tx: mpsc::Sender<(u32, Bytes)>,
 
-    /// Session state
     is_closed: Arc<AtomicBool>,
 
-    /// Padding configuration
     padding: Arc<PaddingFactory>,
-
-    /// Client/Server mode
     is_client: bool,
-
-    /// Padding state (client only)
     send_padding: AtomicBool,
     pkt_counter: AtomicU32,
 
-    /// Buffering state (for initial settings+SYN coalescing)
     buffering: AtomicBool,
     buffer: Mutex<Vec<u8>>,
-
-    /// Reusable write buffer to avoid allocations in hot path
     write_buf: Mutex<BytesMut>,
 
-    /// Protocol version negotiation
     peer_version: AtomicU8,
-
-    /// Server settings received
     received_client_settings: AtomicBool,
 
-    // === Stream handling dependencies (server mode) ===
-    /// Resolver for destination addresses (always required)
     resolver: Arc<dyn Resolver>,
-
-    /// Proxy provider for routing decisions (always required - direct connect is dangerous)
     proxy_provider: Arc<ClientProxySelector>,
-
-    /// UDP enabled for UoT support
     udp_enabled: bool,
-
-    /// Authenticated user name for logging
     user_name: String,
 
-    /// Initial data buffered during auth (to be prepended to first read)
     initial_data: std::sync::Mutex<Option<Box<[u8]>>>,
 }
 
 impl AnyTlsSession {
-    /// Create a new server session with optional initial data that was buffered during auth.
     pub fn new_server_with_initial_data<IO>(
         conn: IO,
         padding: Arc<PaddingFactory>,
@@ -183,6 +146,10 @@ impl AnyTlsSession {
         self.is_closed.load(Ordering::Relaxed)
     }
 
+    pub fn peer_version(&self) -> u8 {
+        self.peer_version.load(Ordering::Relaxed)
+    }
+
     fn is_benign_session_error(err: &io::Error) -> bool {
         let s = err.to_string().to_ascii_lowercase();
         s.contains("peer closed connection without sending tls close_notify")
@@ -212,6 +179,11 @@ impl AnyTlsSession {
             .is_ok()
         {
             {
+                let mut streams = self.streams.write().await;
+                streams.clear();
+            }
+
+            {
                 let mut tasks = self.stream_tasks.lock().await;
                 for (stream_id, handle) in tasks.drain() {
                     log::trace!("Aborting stream task {}", stream_id);
@@ -219,19 +191,18 @@ impl AnyTlsSession {
                 }
             }
 
-            {
-                let mut streams = self.streams.write().await;
-                streams.clear();
-            }
-
-            if let Ok(mut writer) = self.writer.try_lock() {
+            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, async {
+                let mut writer = self.writer.lock().await;
                 let _ = writer.shutdown().await;
+            })
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    log::warn!("Writer lock or shutdown timed out during close, skipping graceful shutdown to prevent deadlock");
+                }
             }
         }
-    }
-
-    pub fn peer_version(&self) -> u8 {
-        self.peer_version.load(Ordering::Relaxed)
     }
 
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
@@ -351,10 +322,6 @@ impl AnyTlsSession {
                 };
 
                 if let Some(tx) = tx {
-                    // FIX 1: Removed the 3-second forced timeout self-destruct logic.
-                    // Allowing `.await` here naturally transfers backpressure to the underlying
-                    // TCP connection's sliding window. This ensures that a slow-consuming stream
-                    // will throttle the sender gracefully instead of violently killing the connection.
                     if tx.send(frame.data).await.is_err() {
                         log::trace!("Stream {} channel closed natively", stream_id);
                     }
@@ -418,14 +385,21 @@ impl AnyTlsSession {
                             }
                             Err(e) => {
                                 if AnyTlsSession::is_benign_stream_error(&e) {
-                                    log::trace!("AnyTLS stream {} ended: {}", stream_id_for_cleanup, e);
+                                    log::trace!(
+                                        "AnyTLS stream {} ended: {}",
+                                        stream_id_for_cleanup,
+                                        e
+                                    );
                                 } else {
-                                    log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
+                                    log::debug!(
+                                        "AnyTLS stream {} error: {}",
+                                        stream_id_for_cleanup,
+                                        e
+                                    );
                                 }
                             }
                         }
 
-                        // Stream self-cleanup mechanism
                         let mut tasks = session_for_cleanup.stream_tasks.lock().await;
                         tasks.remove(&stream_id_for_cleanup);
                     });
@@ -457,12 +431,17 @@ impl AnyTlsSession {
                     streams.remove(&stream_id)
                 };
 
-                // FIX 2: Removed `handle.abort()`.
-                // Smoothly sending EOF (Bytes::new) through the channel allows the underlying copy 
-                // tasks to consume the remaining buffered data before exiting naturally. This prevents 
-                // the tail end of web pages or files from being truncated due to abrupt task termination.
                 if let Some(tx) = stream_tx {
-                    let _ = tx.send(Bytes::new()).await;
+                    match tx.try_send(Bytes::new()) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::trace!(
+                                "Stream {} FIN EOF not delivered immediately; falling back to channel close",
+                                stream_id
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
             }
 
@@ -534,17 +513,8 @@ impl AnyTlsSession {
             }
 
             Command::HeartRequest => {
-                // FIX 3: Respond to heartbeats asynchronously to prevent deadlocks!
-                // Placing the response in a separate task ensures that the network layer 
-                // can continue to receive packets without delay even when `recv_loop` is under high load.
-                let session = Arc::clone(self);
-                let stream_id = frame.stream_id;
-                tokio::spawn(async move {
-                    let response = Frame::control(Command::HeartResponse, stream_id);
-                    if let Err(e) = session.write_control_frame(&response).await {
-                        log::debug!("Failed to send HeartResponse: {}", e);
-                    }
-                });
+                let response = Frame::control(Command::HeartResponse, frame.stream_id);
+                self.write_control_frame(&response).await?;
             }
 
             Command::HeartResponse => {
@@ -556,15 +526,11 @@ impl AnyTlsSession {
     }
 
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
-        // FIX 4: Refined lock granularity to prevent lock contention.
-        // The scope of the `write_buf` lock is now strictly limited to buffer encoding. 
-        // Once the bytes are extracted via `split()`, the lock is released immediately 
-        // before blocking on the actual underlying IO write operations.
         let write_data = {
             let mut write_buf = self.write_buf.lock().await;
             write_buf.clear();
             frame.encode_into(&mut write_buf);
-            write_buf.split() // Quickly extract the data block and release the lock
+            write_buf.split()
         };
 
         if self.buffering.load(Ordering::Relaxed) {
@@ -709,7 +675,7 @@ impl AnyTlsSession {
                 Ok(Ok(dest)) => dest,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ = stream.shutdown().await;
+                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -799,8 +765,8 @@ impl AnyTlsSession {
                 let result =
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-                let _ = stream.shutdown().await;
-                let _ = client_stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
 
                 if let Err(e) = &result {
                     if Self::is_benign_stream_error(e) {
@@ -819,7 +785,7 @@ impl AnyTlsSession {
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
 
                 log::debug!("AnyTLS stream {} blocked by rules", stream_id);
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("Connection to {} blocked by rules", destination),
@@ -831,12 +797,13 @@ impl AnyTlsSession {
     async fn handle_uot_v2(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
         log::trace!("AnyTLS stream {} UoT V2 setup started", stream_id);
+
         if !self.udp_enabled {
             log::debug!(
                 "AnyTLS stream {} UoT V2 rejected: UDP not enabled",
                 stream_id
             );
-            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UDP not enabled for AnyTLS",
@@ -847,7 +814,7 @@ impl AnyTlsSession {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("UoT header read timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -861,7 +828,7 @@ impl AnyTlsSession {
                 Ok(Ok(dest)) => dest,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ = stream.shutdown().await;
+                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -884,7 +851,7 @@ impl AnyTlsSession {
             1 => self.handle_uot_v2_connect(stream, destination).await,
             0 => self.handle_uot_multi_destination(stream).await,
             _ => {
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid UoT V2 connect flag: {}", is_connect),
@@ -896,12 +863,13 @@ impl AnyTlsSession {
     async fn handle_uot_v1(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
         log::trace!("AnyTLS stream {} UoT V1 setup started", stream_id);
+
         if !self.udp_enabled {
             log::debug!(
                 "AnyTLS stream {} UoT V1 rejected: UDP not enabled",
                 stream_id
             );
-            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UDP not enabled for AnyTLS",
@@ -934,7 +902,7 @@ impl AnyTlsSession {
             Ok(Err(e)) => {
                 let error_msg = format!("UDP route decision failed: {}", e);
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                 return Err(e);
             }
             Err(_) => {
@@ -943,7 +911,7 @@ impl AnyTlsSession {
                     STREAM_CONNECT_TIMEOUT
                 );
                 let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                 return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
             }
         };
@@ -1008,7 +976,7 @@ impl AnyTlsSession {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
 
                 log::warn!(
                     "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
