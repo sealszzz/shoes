@@ -36,9 +36,11 @@
 //! - 0x02: Domain (1 byte length + domain)
 
 pub mod uot_common;
+mod uot_server;
 mod uot_v1;
 mod uot_v2;
 
+pub use uot_server::{run_uot_multi_destination, run_uot_v2_connect};
 pub use uot_v1::UotV1ServerStream;
 pub use uot_v2::{read_uot_v2_request, UotV2Mode, UotV2Request};
 
