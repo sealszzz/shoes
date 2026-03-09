@@ -4,26 +4,22 @@ use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
-use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
-use crate::routing::{run_udp_routing, ServerStream};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::{
-    read_uot_v2_request, UotV1ServerStream, UotV2Mode, UOT_V1_MAGIC_ADDRESS,
-    UOT_V2_MAGIC_ADDRESS,
+    read_uot_v2_request, run_uot_multi_destination, run_uot_v2_connect, UotV2Mode,
+    UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS,
 };
-use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -202,7 +198,9 @@ impl AnyTlsSession {
             {
                 Ok(_) => {}
                 Err(_) => {
-                    log::warn!("Writer lock or shutdown timed out during close, skipping graceful shutdown to prevent deadlock");
+                    log::warn!(
+                        "Writer lock or shutdown timed out during close, skipping graceful shutdown to prevent deadlock"
+                    );
                 }
             }
         }
@@ -678,8 +676,7 @@ impl AnyTlsSession {
                 Ok(Ok(dest)) => dest,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ =
-                        tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -770,8 +767,7 @@ impl AnyTlsSession {
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
                 let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                let _ =
-                    tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
+                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
 
                 if let Err(e) = &result {
                     if Self::is_benign_stream_error(e) {
@@ -821,8 +817,7 @@ impl AnyTlsSession {
                 Ok(Ok(req)) => req,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ =
-                        tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -874,108 +869,48 @@ impl AnyTlsSession {
 
     async fn handle_uot_v2_connect(
         &self,
-        mut stream: AnyTlsStream,
+        stream: AnyTlsStream,
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let action = match tokio::time::timeout(
+        log::debug!(
+            "AnyTLS stream {} UoT V2 connect: routing {} through chain",
+            stream_id,
+            destination
+        );
+
+        let result = run_uot_v2_connect(
+            stream,
+            destination.clone(),
+            self.proxy_provider.clone(),
+            self.resolver.clone(),
             STREAM_CONNECT_TIMEOUT,
-            self.proxy_provider.judge(destination.clone().into(), &self.resolver),
         )
-        .await
-        {
-            Ok(Ok(action)) => action,
-            Ok(Err(e)) => {
-                let error_msg = format!("UDP route decision failed: {}", e);
-                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                return Err(e);
-            }
-            Err(_) => {
-                let error_msg = format!(
-                    "UDP route decision timed out after {:?}",
-                    STREAM_CONNECT_TIMEOUT
-                );
-                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
-            }
-        };
+        .await;
 
-        match action {
-            ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            } => {
-                log::debug!(
-                    "AnyTLS stream {} UoT V2 connect: routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
-
-                let server_stream: Box<dyn AsyncMessageStream> =
-                    Box::new(VlessMessageStream::new(stream));
-
-                let client_stream = match tokio::time::timeout(
-                    STREAM_CONNECT_TIMEOUT,
-                    chain_group.connect_udp_bidirectional(&self.resolver, remote_location),
-                )
-                .await
-                {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(e)) => {
-                        let error_msg = format!("UDP connect failed: {}", e);
-                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        let error_msg =
-                            format!("UDP connect timed out after {:?}", STREAM_CONNECT_TIMEOUT);
-                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, error_msg));
-                    }
-                };
-
+        match &result {
+            Ok(()) => {
                 let _ = self.send_synack(stream_id, None).await;
-
-                log::debug!("AnyTLS stream {} UoT V2 connect: connected", stream_id);
-
-                let result = run_udp_copy(server_stream, client_stream, false, false).await;
-
-                if let Err(e) = &result {
-                    if Self::is_benign_stream_error(e) {
-                        log::trace!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
-                    } else {
-                        log::debug!(
-                            "AnyTLS stream {} UoT V2 connect ended with error: {}",
-                            stream_id,
-                            e
-                        );
-                    }
-                } else {
-                    log::trace!("AnyTLS stream {} UoT V2 connect completed", stream_id);
-                }
-
-                result
+                log::trace!("AnyTLS stream {} UoT V2 connect completed", stream_id);
             }
-            ConnectDecision::Block => {
-                let _ = self
-                    .send_synack(stream_id, Some("UDP blocked by rules"))
-                    .await;
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+            Err(e) => {
+                let error_msg = e.to_string();
+                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
 
-                log::warn!(
-                    "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
-                    stream_id,
-                    destination
-                );
-                Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "UDP blocked by rules",
-                ))
+                if Self::is_benign_stream_error(e) {
+                    log::trace!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
+                } else {
+                    log::debug!(
+                        "AnyTLS stream {} UoT V2 connect ended with error: {}",
+                        stream_id,
+                        e
+                    );
+                }
             }
         }
+
+        result
     }
 
     async fn handle_uot_multi_destination(&self, stream: AnyTlsStream) -> io::Result<()> {
@@ -986,18 +921,11 @@ impl AnyTlsSession {
             stream_id
         );
 
-        let server_stream: Box<dyn AsyncTargetedMessageStream> =
-            Box::new(UotV1ServerStream::new(stream));
-
         let _ = self.send_synack(stream_id, None).await;
 
-        let result = run_udp_routing(
-            ServerStream::Targeted(server_stream),
-            self.proxy_provider.clone(),
-            self.resolver.clone(),
-            false,
-        )
-        .await;
+        let result =
+            run_uot_multi_destination(stream, self.proxy_provider.clone(), self.resolver.clone())
+                .await;
 
         if let Err(e) = &result {
             if Self::is_benign_stream_error(e) {
