@@ -55,14 +55,15 @@ jobs:
         working-directory: shoes
         run: |
           set -euo pipefail
-
+   
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_server_session.rs -o src/anytls/anytls_server_session.rs
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_uot_server.rs -o src/anytls/anytls_uot_server.rs
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/mod.rs -o src/anytls/mod.rs
 
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/mod.rs -o src/uot/mod.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_common.rs -o src/uot/uot_common.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_v1.rs -o src/uot/uot_v1.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_v2.rs -o src/uot/uot_v2.rs
-          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/uot/uot_server.rs -o src/uot/uot_server.rs
 
       - working-directory: shoes
         run: |
