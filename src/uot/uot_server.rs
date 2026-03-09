@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use crate::address::NetLocation;
 use crate::anytls::AnyTlsStream;
-use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::Resolver;
 use crate::routing::{run_udp_routing, ServerStream};
