@@ -42,7 +42,7 @@ mod uot_v2;
 
 pub use uot_server::{run_uot_multi_destination, run_uot_v2_connect};
 pub use uot_v1::UotV1ServerStream;
-pub use uot_v2::{read_uot_v2_request, UotV2Mode, UotV2Request};
+pub use uot_v2::{read_uot_v2_request, UotV2Mode};
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream
 pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;
