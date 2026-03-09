@@ -36,10 +36,10 @@
 //! - 0x02: Domain (1 byte length + domain)
 
 pub mod uot_common;
-mod uot_v1_server_stream;
+mod uot_v1;
 mod uot_v2;
 
-pub use uot_v1_server_stream::UotV1ServerStream;
+pub use uot_v1::UotV1ServerStream;
 pub use uot_v2::{read_uot_v2_request, UotV2Mode, UotV2Request};
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream
