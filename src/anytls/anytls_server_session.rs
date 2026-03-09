@@ -11,16 +11,19 @@ use crate::resolver::Resolver;
 use crate::routing::{run_udp_routing, ServerStream};
 use crate::socks_handler::read_location_direct;
 use crate::tcp::tcp_server::run_udp_copy;
-use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
+use crate::uot::{
+    read_uot_v2_request, UotV1ServerStream, UotV2Mode, UOT_V1_MAGIC_ADDRESS,
+    UOT_V2_MAGIC_ADDRESS,
+};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -675,7 +678,8 @@ impl AnyTlsSession {
                 Ok(Ok(dest)) => dest,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                    let _ =
+                        tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("read destination timed out after {:?}", STREAM_INIT_TIMEOUT),
@@ -766,7 +770,8 @@ impl AnyTlsSession {
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
                 let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
+                let _ =
+                    tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
 
                 if let Err(e) = &result {
                     if Self::is_benign_stream_error(e) {
@@ -810,29 +815,18 @@ impl AnyTlsSession {
             ));
         }
 
-        let is_connect = match tokio::time::timeout(STREAM_INIT_TIMEOUT, stream.read_u8()).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("UoT header read timed out after {:?}", STREAM_INIT_TIMEOUT),
-                ));
-            }
-        };
-
-        let destination =
-            match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_location_direct(&mut stream)).await
+        let request =
+            match tokio::time::timeout(STREAM_INIT_TIMEOUT, read_uot_v2_request(&mut stream)).await
             {
-                Ok(Ok(dest)) => dest,
+                Ok(Ok(req)) => req,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                    let _ =
+                        tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
-                            "UoT destination read timed out after {:?}",
+                            "UoT V2 request read timed out after {:?}",
                             STREAM_INIT_TIMEOUT
                         ),
                     ));
@@ -840,23 +834,16 @@ impl AnyTlsSession {
             };
 
         log::debug!(
-            "AnyTLS stream {} UoT V2 (user: {}, connect={}) -> {}",
+            "AnyTLS stream {} UoT V2 (user: {}, mode={:?}) -> {}",
             stream_id,
             self.user_name,
-            is_connect,
-            destination
+            request.mode,
+            request.destination
         );
 
-        match is_connect {
-            1 => self.handle_uot_v2_connect(stream, destination).await,
-            0 => self.handle_uot_multi_destination(stream).await,
-            _ => {
-                let _ = tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid UoT V2 connect flag: {}", is_connect),
-                ))
-            }
+        match request.mode {
+            UotV2Mode::Connect => self.handle_uot_v2_connect(stream, request.destination).await,
+            UotV2Mode::Packet => self.handle_uot_multi_destination(stream).await,
         }
     }
 
@@ -1088,7 +1075,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_frame_types() {
-        // Test all control frame types
         for (cmd, expected_byte) in [
             (Command::Waste, 0),
             (Command::Syn, 1),
@@ -1123,7 +1109,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_streams_frame_interleaving() {
-        // Simulate multiple streams sending data - verify framing isolation
         let stream1_data = Frame::data(1, Bytes::from("stream1-data"));
         let stream2_data = Frame::data(2, Bytes::from("stream2-data"));
         let stream3_data = Frame::data(3, Bytes::from("stream3-data"));
@@ -1133,7 +1118,6 @@ mod tests {
         combined.extend_from_slice(&stream2_data.encode());
         combined.extend_from_slice(&stream3_data.encode());
 
-        // Decode all frames
         let f1 = FrameCodec::decode(&mut combined).unwrap().unwrap();
         let f2 = FrameCodec::decode(&mut combined).unwrap().unwrap();
         let f3 = FrameCodec::decode(&mut combined).unwrap().unwrap();
@@ -1148,7 +1132,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fin_and_syn_sequence() {
-        // Test SYN -> PSH -> FIN sequence
         let syn = Frame::control(Command::Syn, 1);
         let data = Frame::data(1, Bytes::from("payload"));
         let fin = Frame::control(Command::Fin, 1);
@@ -1184,7 +1167,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_frame() {
-        // Test frame with max-ish size (16KB)
         let large_data = vec![0xABu8; 16384];
         let frame = Frame::data(99, Bytes::from(large_data.clone()));
         let encoded = frame.encode();
@@ -1199,16 +1181,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_frame_decode() {
-        // Test that partial frames don't decode until complete
         let frame = Frame::data(1, Bytes::from("complete"));
         let encoded = frame.encode();
 
-        // Only provide partial data
-        let mut partial = BytesMut::from(&encoded[..5]); // Only header partial
+        let mut partial = BytesMut::from(&encoded[..5]);
         let result = FrameCodec::decode(&mut partial).unwrap();
         assert!(result.is_none());
 
-        // Add remaining data
         partial.extend_from_slice(&encoded[5..]);
         let decoded = FrameCodec::decode(&mut partial).unwrap().unwrap();
         assert_eq!(decoded.data.as_ref(), b"complete");
@@ -1216,7 +1195,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_waste_frame_padding() {
-        // Test padding frame
         let padding_data = vec![0u8; 100];
         let waste = Frame::with_data(Command::Waste, 0, Bytes::from(padding_data.clone()));
         let encoded = waste.encode();
@@ -1240,11 +1218,9 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send SYN without Settings first
         let syn_frame = Frame::control(Command::Syn, 1);
         server.write_all(&syn_frame.encode()).await.unwrap();
 
-        // Should receive Alert
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
@@ -1269,7 +1245,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings first
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1277,15 +1252,12 @@ mod tests {
             Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
         server.write_all(&settings_frame.encode()).await.unwrap();
 
-        // Wait for and consume the ServerSettings response
         let mut buf = vec![0u8; 128];
         let _ = timeout(Duration::from_millis(200), server.read(&mut buf)).await;
 
-        // Send heartbeat request
         let heart_request = Frame::control(Command::HeartRequest, 0);
         server.write_all(&heart_request.encode()).await.unwrap();
 
-        // Should receive heartbeat response
         let mut response_buf = vec![0u8; 16];
         let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
 
@@ -1299,17 +1271,14 @@ mod tests {
         run_task.abort();
     }
 
-    // ===== Frame parsing edge case tests =====
-
     #[test]
     fn test_frame_zero_length_data() {
         let frame = Frame::data(1, Bytes::new());
         let encoded = frame.encode();
 
-        assert_eq!(encoded.len(), FRAME_HEADER_SIZE); // Just header, no data
+        assert_eq!(encoded.len(), FRAME_HEADER_SIZE);
         assert_eq!(encoded[0], Command::Psh as u8);
 
-        // Decode should work
         let mut buf = BytesMut::from(&encoded[..]);
         let decoded = FrameCodec::decode(&mut buf).unwrap().unwrap();
         assert!(decoded.data.is_empty());
@@ -1327,7 +1296,6 @@ mod tests {
 
     #[test]
     fn test_frame_decode_incomplete_header() {
-        // Less than 7 bytes
         let mut buf = BytesMut::from(&[0x00, 0x00, 0x00][..]);
         let result = FrameCodec::decode(&mut buf).unwrap();
         assert!(result.is_none());
@@ -1335,12 +1303,11 @@ mod tests {
 
     #[test]
     fn test_frame_decode_incomplete_data() {
-        // Header says 100 bytes of data, but only 50 provided
         let mut buf = BytesMut::with_capacity(64);
-        buf.extend_from_slice(&[Command::Psh as u8]); // cmd
-        buf.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
-        buf.extend_from_slice(&[0, 100]); // length = 100
-        buf.extend_from_slice(&[0u8; 50]); // only 50 bytes of data
+        buf.extend_from_slice(&[Command::Psh as u8]);
+        buf.extend_from_slice(&[0, 0, 0, 1]);
+        buf.extend_from_slice(&[0, 100]);
+        buf.extend_from_slice(&[0u8; 50]);
 
         let result = FrameCodec::decode(&mut buf).unwrap();
         assert!(result.is_none());
@@ -1348,11 +1315,10 @@ mod tests {
 
     #[test]
     fn test_frame_unknown_command_returns_error() {
-        // Command byte 255 is not defined
         let mut buf = BytesMut::with_capacity(16);
-        buf.extend_from_slice(&[255u8]); // unknown cmd
-        buf.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
-        buf.extend_from_slice(&[0, 0]); // length = 0
+        buf.extend_from_slice(&[255u8]);
+        buf.extend_from_slice(&[0, 0, 0, 1]);
+        buf.extend_from_slice(&[0, 0]);
 
         let result = FrameCodec::decode(&mut buf);
         assert!(result.is_err());
@@ -1384,12 +1350,10 @@ mod tests {
 
     #[test]
     fn test_frame_max_data_length() {
-        // Max u16 = 65535 bytes
         let large_data = vec![0xFFu8; 65535];
         let frame = Frame::data(1, Bytes::from(large_data.clone()));
         let encoded = frame.encode();
 
-        // Verify length field
         let len = u16::from_be_bytes([encoded[5], encoded[6]]);
         assert_eq!(len, 65535);
 
@@ -1397,8 +1361,6 @@ mod tests {
         let decoded = FrameCodec::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.data.len(), 65535);
     }
-
-    // ===== Session protocol edge case tests =====
 
     #[tokio::test]
     async fn test_session_psh_for_nonexistent_stream() {
@@ -1411,7 +1373,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1421,12 +1382,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send PSH for stream 999 (never opened)
-        // This should NOT crash the session
         let psh = Frame::data(999, Bytes::from("orphan data"));
         server.write_all(&psh.encode()).await.unwrap();
 
-        // Session should still be alive - send heartbeat to verify
         tokio::time::sleep(Duration::from_millis(100)).await;
         let heart = Frame::control(Command::HeartRequest, 0);
         let result = server.write_all(&heart.encode()).await;
@@ -1447,7 +1405,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1457,12 +1414,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send FIN for stream 999 (never opened)
-        // Should be gracefully ignored
         let fin = Frame::control(Command::Fin, 999);
         server.write_all(&fin.encode()).await.unwrap();
 
-        // Session should still be alive
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!session.is_closed());
 
@@ -1481,7 +1435,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1491,12 +1444,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send waste (padding) frame with data
         let padding_data = vec![0u8; 500];
         let waste = Frame::with_data(Command::Waste, 0, Bytes::from(padding_data));
         server.write_all(&waste.encode()).await.unwrap();
 
-        // Session should still function
         tokio::time::sleep(Duration::from_millis(100)).await;
         let syn = Frame::control(Command::Syn, 1);
         let result = server.write_all(&syn.encode()).await;
@@ -1517,7 +1468,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings with mismatched padding MD5
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", "different_md5_value");
@@ -1525,14 +1475,11 @@ mod tests {
             Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
         server.write_all(&settings_frame.encode()).await.unwrap();
 
-        // Should receive UpdatePaddingScheme frame
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
         if let Ok(Ok(n)) = result {
             if n >= 7 {
-                // Could be ServerSettings or UpdatePaddingScheme
-                // Either is valid response
                 let cmd = buf[0];
                 assert!(
                     cmd == Command::UpdatePaddingScheme as u8
@@ -1556,7 +1503,6 @@ mod tests {
             let _ = session_clone.run().await;
         });
 
-        // Send settings first
         let mut settings = StringMap::new();
         settings.insert("v", "2");
         settings.insert("padding-md5", PaddingFactory::default_factory().md5());
@@ -1566,18 +1512,14 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send Alert from client
         let alert = Frame::with_data(Command::Alert, 0, Bytes::from("client error"));
         server.write_all(&alert.encode()).await.unwrap();
 
-        // Session should close
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(session.is_closed());
 
         run_task.abort();
     }
-
-    // ===== StringMap tests =====
 
     #[test]
     fn test_stringmap_roundtrip() {
@@ -1607,15 +1549,12 @@ mod tests {
     #[test]
     fn test_stringmap_newlines_in_values() {
         let mut map = StringMap::new();
-        map.insert("multiline", "line1\nline2"); // Should not break parsing
+        map.insert("multiline", "line1\nline2");
 
         let bytes = map.to_bytes();
         let parsed = StringMap::from_bytes(&bytes);
 
-        // With newlines, parsing may be affected
-        // This test documents current behavior
         let val = parsed.get("multiline");
-        // Value may be truncated at newline
         assert!(val.is_none() || val == Some(&"line1".to_string()));
     }
 
