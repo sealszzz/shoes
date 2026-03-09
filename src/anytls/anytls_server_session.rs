@@ -4,14 +4,12 @@ use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
+use crate::anytls::{run_uot_multi_destination, run_uot_v2_connect};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::socks_handler::read_location_direct;
-use crate::uot::{
-    read_uot_v2_request, run_uot_multi_destination, run_uot_v2_connect, UotV2Mode,
-    UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS,
-};
+use crate::uot::{read_uot_v2_request, UotV2Mode, UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
