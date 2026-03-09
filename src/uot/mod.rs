@@ -17,16 +17,13 @@
 //!
 //! #### V2 Connect Mode (isConnect=1)
 //! - Single destination specified in request header
-//! - Subsequent packets: `[length:u16be][data]` (no address per packet)
-//! - Uses VlessMessageStream format
+//! - Subsequent packets: `[length:u16be][data]`
 //!
 //! #### V2 Non-Connect Mode (isConnect=0)
 //! - Multi-destination mode (same as V1)
 //! - Subsequent packets: `[AddrParser address][length:u16be][data]`
 //!
-//! ## Address Formats (IMPORTANT!)
-//!
-//! Two different address formats are used:
+//! ## Address Formats
 //!
 //! ### SOCKS5 Format (used in V2 request header)
 //! - 0x01: IPv4 (4 bytes)
@@ -40,10 +37,12 @@
 
 pub mod uot_common;
 mod uot_v1_server_stream;
+mod uot_v2;
 
 pub use uot_v1_server_stream::UotV1ServerStream;
+pub use uot_v2::{read_uot_v2_request, UotV2Mode, UotV2Request};
 
-/// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
+/// UoT V2 connect mode stream - identical format to VlessMessageStream
 pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;
 
 /// Magic address used to signal UoT V1 mode (multi-destination)
