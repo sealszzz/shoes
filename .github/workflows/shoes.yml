@@ -56,6 +56,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_stream.rs -o src/anytls/anytls_stream.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_server_session.rs -o src/anytls/anytls_server_session.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/anytls_uot_server.rs -o src/anytls/anytls_uot_server.rs
           curl -fsL https://raw.githubusercontent.com/sealszzz/shoes/main/src/anytls/mod.rs -o src/anytls/mod.rs
