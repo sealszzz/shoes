@@ -1,11 +1,12 @@
-//! UoT server-side execution helpers.
+//! AnyTLS-specific UoT server-side execution helpers.
 
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::address::NetLocation;
-use crate::anytls::AnyTlsStream;
+use crate::anytls::anytls_stream::AnyTlsStream;
+use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::Resolver;
 use crate::routing::{run_udp_routing, ServerStream};
