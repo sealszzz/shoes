@@ -84,19 +84,16 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
         }
 
         loop {
-            match this.try_parse_packet()? {
-                Some((location, payload_start, payload_len)) => {
-                    let data = this.read_buf.as_slice();
-                    
-                    let copy_len = std::cmp::min(payload_len, buf.remaining());
-                    buf.put_slice(&data[payload_start..payload_start + copy_len]);
+            if let Some((location, payload_start, payload_len)) = this.try_parse_packet()? {
+                let data = this.read_buf.as_slice();
 
-                    let total_consumed = payload_start + payload_len;
-                    this.read_buf.consume(total_consumed);
+                let copy_len = std::cmp::min(payload_len, buf.remaining());
+                buf.put_slice(&data[payload_start..payload_start + copy_len]);
 
-                    return Poll::Ready(Ok(location));
-                }
-                None => {}
+                let total_consumed = payload_start + payload_len;
+                this.read_buf.consume(total_consumed);
+
+                return Poll::Ready(Ok(location));
             }
 
             this.read_buf.maybe_compact(4096);
@@ -138,7 +135,9 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero))),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)));
+                }
                 Poll::Ready(Ok(n)) => this.write_buf_sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -173,7 +172,9 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for UotV1ServerStream<S> {
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero))),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)));
+                }
                 Poll::Ready(Ok(n)) => this.write_buf_sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => break,
@@ -191,7 +192,9 @@ impl<S: AsyncStream> AsyncFlushMessage for UotV1ServerStream<S> {
         while this.write_buf_sent < this.write_buf_len {
             let remaining = &this.write_buf[this.write_buf_sent..this.write_buf_len];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero))),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)));
+                }
                 Poll::Ready(Ok(n)) => this.write_buf_sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
