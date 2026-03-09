@@ -13,8 +13,8 @@ use crate::uot::{read_uot_v2_request, UotV2Mode, UOT_V1_MAGIC_ADDRESS, UOT_V2_MA
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -24,6 +24,9 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+const DATA_BATCH_MAX_FRAMES: usize = 64;
+const DATA_BATCH_MAX_BYTES: usize = 256 * 1024;
 
 pub struct AnyTlsSession {
     reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
@@ -71,7 +74,7 @@ impl AnyTlsSession {
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (reader, writer) = tokio::io::split(conn);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 8);
 
         Arc::new(Self {
             reader: Mutex::new(Box::new(reader)),
@@ -107,7 +110,7 @@ impl AnyTlsSession {
         use crate::resolver::NativeResolver;
 
         let (reader, writer) = tokio::io::split(conn);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 8);
 
         let proxy_provider = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
             vec![],
@@ -235,38 +238,60 @@ impl AnyTlsSession {
 
     async fn process_outgoing(&self) {
         let mut rx = self.outgoing_rx.lock().await;
+        let mut batch = BytesMut::with_capacity(DATA_BATCH_MAX_BYTES + 4096);
+        let mut closed_streams: Vec<u32> = Vec::with_capacity(DATA_BATCH_MAX_FRAMES);
 
         while let Some((stream_id, data)) = rx.recv().await {
             if self.is_closed() {
                 break;
             }
 
-            if data.is_empty() {
-                let frame = Frame::control(Command::Fin, stream_id);
-                if let Err(e) = self.write_frame(&frame).await {
-                    log::warn!(
-                        "Failed to send FIN for stream {}: {}, closing session",
-                        stream_id,
-                        e
-                    );
-                    self.close().await;
+            batch.clear();
+            closed_streams.clear();
+
+            self.encode_outgoing_item(stream_id, data, &mut batch, &mut closed_streams);
+
+            for _ in 1..DATA_BATCH_MAX_FRAMES {
+                if batch.len() >= DATA_BATCH_MAX_BYTES {
                     break;
                 }
 
-                let mut streams = self.streams.write().await;
-                streams.remove(&stream_id);
-            } else {
-                let frame = Frame::data(stream_id, data);
-                if let Err(e) = self.write_frame(&frame).await {
-                    log::warn!(
-                        "Failed to send data for stream {}: {}, closing session",
-                        stream_id,
-                        e
-                    );
-                    self.close().await;
-                    break;
+                match rx.try_recv() {
+                    Ok((sid, data)) => {
+                        self.encode_outgoing_item(sid, data, &mut batch, &mut closed_streams);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
+
+            if let Err(e) = self.write_data_batch(&batch).await {
+                log::warn!("Failed to send AnyTLS data batch: {}, closing session", e);
+                self.close().await;
+                break;
+            }
+
+            if !closed_streams.is_empty() {
+                let mut streams = self.streams.write().await;
+                for sid in closed_streams.drain(..) {
+                    streams.remove(&sid);
+                }
+            }
+        }
+    }
+
+    fn encode_outgoing_item(
+        &self,
+        stream_id: u32,
+        data: Bytes,
+        batch: &mut BytesMut,
+        closed_streams: &mut Vec<u32>,
+    ) {
+        if data.is_empty() {
+            Frame::control(Command::Fin, stream_id).encode_into(batch);
+            closed_streams.push(stream_id);
+        } else {
+            Frame::data(stream_id, data).encode_into(batch);
         }
     }
 
@@ -525,16 +550,30 @@ impl AnyTlsSession {
     }
 
     async fn write_frame(&self, frame: &Frame) -> io::Result<()> {
-        let write_data = {
+        let encoded = {
             let mut write_buf = self.write_buf.lock().await;
             write_buf.clear();
             frame.encode_into(&mut write_buf);
             write_buf.split()
         };
 
+        self.write_encoded_bytes(encoded, true).await
+    }
+
+    async fn write_data_batch(&self, batch: &[u8]) -> io::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut bytes = BytesMut::with_capacity(batch.len());
+        bytes.extend_from_slice(batch);
+        self.write_encoded_bytes(bytes, true).await
+    }
+
+    async fn write_encoded_bytes(&self, data: BytesMut, flush: bool) -> io::Result<()> {
         if self.buffering.load(Ordering::Relaxed) {
             let mut buffer = self.buffer.lock().await;
-            buffer.extend_from_slice(&write_data);
+            buffer.extend_from_slice(&data);
             return Ok(());
         }
 
@@ -542,11 +581,11 @@ impl AnyTlsSession {
             let mut buffer = self.buffer.lock().await;
             if !buffer.is_empty() {
                 let mut combined = BytesMut::from(&buffer[..]);
-                combined.extend_from_slice(&write_data);
+                combined.extend_from_slice(&data);
                 buffer.clear();
                 combined
             } else {
-                write_data
+                data
             }
         };
 
@@ -554,7 +593,7 @@ impl AnyTlsSession {
             let pkt = self.pkt_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
             if pkt < self.padding.stop() {
-                return self.write_with_padding(combined_data, pkt).await;
+                return self.write_with_padding(combined_data, pkt, flush).await;
             } else {
                 self.send_padding.store(false, Ordering::Relaxed);
             }
@@ -562,16 +601,22 @@ impl AnyTlsSession {
 
         let mut writer = self.writer.lock().await;
         writer.write_all(&combined_data).await?;
-        writer.flush().await
+        if flush {
+            writer.flush().await?;
+        }
+        Ok(())
     }
 
-    async fn write_with_padding(&self, mut data: BytesMut, pkt: u32) -> io::Result<()> {
+    async fn write_with_padding(&self, mut data: BytesMut, pkt: u32, flush: bool) -> io::Result<()> {
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
 
         if pkt_sizes.is_empty() {
             let mut writer = self.writer.lock().await;
             writer.write_all(&data).await?;
-            return writer.flush().await;
+            if flush {
+                writer.flush().await?;
+            }
+            return Ok(());
         }
 
         let mut writer = self.writer.lock().await;
@@ -629,7 +674,11 @@ impl AnyTlsSession {
             writer.write_all(&data).await?;
         }
 
-        writer.flush().await
+        if flush {
+            writer.flush().await?;
+        }
+
+        Ok(())
     }
 
     pub async fn send_synack(&self, stream_id: u32, error: Option<&str>) -> io::Result<()> {
